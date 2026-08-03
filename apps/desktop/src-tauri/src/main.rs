@@ -2019,6 +2019,67 @@ fn write_runtime_preference(app: &tauri::AppHandle, preference: &str) -> Result<
     atomic_write(&runtime_preference_path(app)?, &content)
 }
 
+/// ACP process topology preference for `grok agent … stdio`.
+///
+/// - `shared` (default) → `--leader` — join the machine-wide Grok leader (lower
+///   process count when CLI / other ACP clients also use leader; most common).
+/// - `local` → `--no-leader` — dedicated agent so `--plugin-dir` (Computer Use)
+///   works and the shell is isolated from a busy shared leader.
+fn agent_leader_mode_path() -> Result<PathBuf, String> {
+    Ok(grok_home()?.join("desktop-agent-leader-mode.json"))
+}
+
+fn normalize_agent_leader_mode(raw: Option<&str>) -> &'static str {
+    match raw.map(str::trim) {
+        Some("local") | Some("no-leader") => "local",
+        Some("shared") | Some("leader") => "shared",
+        // Default and all unknown / legacy values: shared machine leader.
+        _ => "shared",
+    }
+}
+
+fn agent_leader_cli_flag(mode: &str) -> &'static str {
+    match normalize_agent_leader_mode(Some(mode)) {
+        "local" => "--no-leader",
+        _ => "--leader",
+    }
+}
+
+fn read_agent_leader_mode() -> String {
+    let Ok(path) = agent_leader_mode_path() else {
+        return "shared".into();
+    };
+    let Ok(content) = read_bounded_text(&path, 16 * 1024) else {
+        return "shared".into();
+    };
+    let mode = serde_json::from_str::<serde_json::Value>(&content)
+        .ok()
+        .and_then(|value| value.get("mode")?.as_str().map(str::to_owned));
+    normalize_agent_leader_mode(mode.as_deref()).to_owned()
+}
+
+fn write_agent_leader_mode(mode: &str) -> Result<String, String> {
+    let trimmed = mode.trim();
+    // Accept canonical names plus CLI-flag aliases; reject anything else.
+    if !matches!(trimmed, "local" | "shared" | "leader" | "no-leader") {
+        return Err("未知 Agent 进程模式（请使用 local 或 shared）".into());
+    }
+    let normalized = normalize_agent_leader_mode(Some(trimmed)).to_owned();
+    let content = serde_json::json!({ "mode": normalized }).to_string();
+    atomic_write(&agent_leader_mode_path()?, &content)?;
+    Ok(normalized)
+}
+
+#[tauri::command]
+fn get_agent_leader_mode() -> String {
+    read_agent_leader_mode()
+}
+
+#[tauri::command]
+fn set_agent_leader_mode(mode: String) -> Result<String, String> {
+    write_agent_leader_mode(&mode)
+}
+
 fn grok_binary_version(path: &str) -> Option<String> {
     let mut command = std::process::Command::new(path);
     command
@@ -2462,7 +2523,25 @@ async fn start_project_preview(
 
 async fn terminate_process(mut process: AgentProcess) {
     drop(process.stdin);
-    let _ = process.child.kill().await;
+    // Prefer process-tree kill on Windows so agent grandchildren (tool shells)
+    // do not orphan after the stdio child dies (ported idea from vscode-supergrok).
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        if let Some(pid) = process.child.id() {
+            // std::process::Command — CommandExt::creation_flags applies cleanly.
+            let _ = std::process::Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+                .status();
+        }
+        // Fallback if taskkill is unavailable / failed — still reap the direct child.
+        let _ = process.child.kill().await;
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = process.child.kill().await;
+    }
     let _ = process.child.wait().await;
 }
 
@@ -6977,6 +7056,8 @@ fn export_support_diagnostics() -> Result<String, String> {
         "buildCommit": GROX_BUILD_COMMIT,
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
+        "agentLeaderMode": read_agent_leader_mode(),
+        "agentLeaderCliFlag": agent_leader_cli_flag(&read_agent_leader_mode()),
         "activeProviderId": profiles.active_id,
         "providers": profiles_redacted,
         "providerStatus": env_status,
@@ -6984,6 +7065,7 @@ fn export_support_diagnostics() -> Result<String, String> {
         "notes": [
             "API keys are redacted or marked [dpapi-sealed]; never paste unredacted dumps.",
             "Managed ~/.grok/.env secrets are not included in this export.",
+            "agentLeaderMode: shared=--leader (default), local=--no-leader.",
         ],
     });
     serde_json::to_string_pretty(&dump).map_err(|error| format!("无法序列化诊断信息：{error}"))
@@ -7511,11 +7593,21 @@ async fn acp_spawn(
     let command_path = PathBuf::from(&runtime.path);
     let mut command = Command::new(&command_path);
     command.arg("agent");
-    if let Some(plugin) = computer_plugin.as_ref() {
-        command.arg("--plugin-dir").arg(plugin);
+    // Shared (`--leader`) joins the machine-wide leader; process-scoped
+    // `--plugin-dir` is ignored there and has been implicated in flaky 403s when
+    // mixed with leader attach. Only attach Computer Use plugins in local mode.
+    let leader_mode = read_agent_leader_mode();
+    let leader_flag = agent_leader_cli_flag(&leader_mode);
+    if leader_mode == "local" {
+        if let Some(plugin) = computer_plugin.as_ref() {
+            command.arg("--plugin-dir").arg(plugin);
+        }
     }
+    // Default shared (`--leader`): reuse machine-wide leader with CLI / other ACP.
+    // Operators can switch to local (`--no-leader`) in Settings → Agent when they
+    // need process-scoped `--plugin-dir` (Computer Use) or isolation.
     command
-        .args(["--leader", "--reasoning-effort", "high", "stdio"])
+        .args([leader_flag, "--reasoning-effort", "high", "stdio"])
         .current_dir(&cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -8044,6 +8136,8 @@ fn main() {
             activate_provider_profile,
             delete_provider_profile,
             export_support_diagnostics,
+            get_agent_leader_mode,
+            set_agent_leader_mode,
             grok_runtime_info,
             set_grok_runtime_preference,
             install_official_grok_cli,
@@ -8363,6 +8457,21 @@ api_key = "local-key"
         assert!(should_drop_silent_history_line(&state, flood_a));
         assert!(!should_drop_silent_history_line(&state, flood_b));
         assert!(!should_drop_silent_history_line(&state, rpc_ok));
+    }
+
+    #[test]
+    fn agent_leader_mode_defaults_to_shared_leader() {
+        assert_eq!(normalize_agent_leader_mode(None), "shared");
+        assert_eq!(normalize_agent_leader_mode(Some("")), "shared");
+        assert_eq!(normalize_agent_leader_mode(Some("local")), "local");
+        assert_eq!(normalize_agent_leader_mode(Some("no-leader")), "local");
+        assert_eq!(normalize_agent_leader_mode(Some("shared")), "shared");
+        assert_eq!(normalize_agent_leader_mode(Some("leader")), "shared");
+        assert_eq!(normalize_agent_leader_mode(Some("weird")), "shared");
+        assert_eq!(agent_leader_cli_flag("local"), "--no-leader");
+        assert_eq!(agent_leader_cli_flag("shared"), "--leader");
+        assert_eq!(agent_leader_cli_flag("leader"), "--leader");
+        assert_eq!(agent_leader_cli_flag("garbage"), "--leader");
     }
 
     #[test]
