@@ -899,6 +899,72 @@ function unhideProjectId(id: string) {
   persistHiddenProjectIds(hidden);
 }
 
+/**
+ * Sessions the operator deleted from the sidebar.
+ * CLI `listSessions` / history import must not resurrect them after restart
+ * (process-only offlineHistoryDeleted was not enough).
+ */
+const HIDDEN_SESSIONS_KEY = "grox.hiddenSessions";
+let hiddenSessionIdsCache: Set<string> | null = null;
+let hiddenSessionsHydrated = false;
+
+function loadHiddenSessionIds(): Set<string> {
+  if (hiddenSessionIdsCache) return hiddenSessionIdsCache;
+  hiddenSessionIdsCache = new Set(loadJson<string[]>(HIDDEN_SESSIONS_KEY, []));
+  return hiddenSessionIdsCache;
+}
+
+function persistHiddenSessionIds(ids: Set<string>) {
+  hiddenSessionIdsCache = ids;
+  localStorage.setItem(HIDDEN_SESSIONS_KEY, JSON.stringify([...ids]));
+  if (bridge.kind === "acp") {
+    void invoke("write_hidden_sessions", { ids: [...ids] }).catch(() => {
+      /* offline / older binary */
+    });
+  }
+}
+
+async function hydrateHiddenSessionsFromDisk(): Promise<Set<string>> {
+  const local = loadHiddenSessionIds();
+  if (hiddenSessionsHydrated || bridge.kind !== "acp") return local;
+  hiddenSessionsHydrated = true;
+  try {
+    const fromDisk = await invoke<string[]>("read_hidden_sessions");
+    if (!Array.isArray(fromDisk) || fromDisk.length === 0) return local;
+    for (const id of fromDisk) {
+      if (typeof id === "string" && id.trim()) local.add(id);
+    }
+    localStorage.setItem(HIDDEN_SESSIONS_KEY, JSON.stringify([...local]));
+    hiddenSessionIdsCache = local;
+  } catch {
+    /* command unavailable on older builds */
+  }
+  return local;
+}
+
+function hideSessionId(id: string) {
+  const hidden = loadHiddenSessionIds();
+  hidden.add(id);
+  persistHiddenSessionIds(hidden);
+  // Drop pin/archive flags for deleted ids to avoid flag table growth.
+  try {
+    const flags = loadJson<Record<string, SessionFlags>>("grox.sessionFlags", {});
+    if (flags[id]) {
+      delete flags[id];
+      localStorage.setItem("grox.sessionFlags", JSON.stringify(flags));
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+/** Filter CLI/history imports so deleted missions stay gone across restarts. */
+function filterHiddenSessions(metas: SessionMeta[]): SessionMeta[] {
+  const hidden = loadHiddenSessionIds();
+  if (hidden.size === 0) return metas;
+  return metas.filter((meta) => !hidden.has(meta.id));
+}
+
 function ensureProject(projects: ProjectMeta[], path: string, opts?: { force?: boolean }): ProjectMeta[] {
   const id = projectId(path);
   // User deliberately opened this workspace — allow it back into the list.
@@ -954,20 +1020,29 @@ function mergeProjectSessions(
   cwd: string,
   incoming: SessionMeta[],
 ): SessionMeta[] {
-  const incomingIds = new Set(incoming.map((meta) => meta.id));
+  const filteredIncoming = filterHiddenSessions(incoming);
+  const incomingIds = new Set(filteredIncoming.map((meta) => meta.id));
+  const hidden = loadHiddenSessionIds();
   const merged = [
-    ...decorateSessions(incoming),
-    ...existing.filter((meta) => !samePath(meta.cwd, cwd) && !incomingIds.has(meta.id)),
+    ...decorateSessions(filteredIncoming),
+    ...existing.filter(
+      (meta) =>
+        !hidden.has(meta.id) &&
+        !samePath(meta.cwd, cwd) &&
+        !incomingIds.has(meta.id),
+    ),
   ].sort((a, b) => b.updatedAt - a.updatedAt);
   persistSessionCatalog(merged);
   return merged;
 }
 
 function mergeAllSessions(existing: SessionMeta[], incoming: SessionMeta[]): SessionMeta[] {
-  const incomingIds = new Set(incoming.map((meta) => meta.id));
+  const filteredIncoming = filterHiddenSessions(incoming);
+  const incomingIds = new Set(filteredIncoming.map((meta) => meta.id));
+  const hidden = loadHiddenSessionIds();
   const merged = [
-    ...decorateSessions(incoming),
-    ...existing.filter((meta) => !incomingIds.has(meta.id)),
+    ...decorateSessions(filteredIncoming),
+    ...existing.filter((meta) => !hidden.has(meta.id) && !incomingIds.has(meta.id)),
   ].sort((a, b) => b.updatedAt - a.updatedAt);
   persistSessionCatalog(merged);
   return merged;
@@ -1188,7 +1263,12 @@ export const useDesktop = create<DesktopState>((set, get) => {
       }
       case "session_ready": {
         // Deleted missions must not reappear via late session/new|load.
-        if (offlineHistoryDeleted.has(e.session.id)) break;
+        if (
+          offlineHistoryDeleted.has(e.session.id) ||
+          loadHiddenSessionIds().has(e.session.id)
+        ) {
+          break;
+        }
         const { blocks: _b, usage: _u, status: _st, ...meta } = e.session;
         const nextIndex = [
           decorateSessions([meta])[0],
@@ -2240,10 +2320,17 @@ export const useDesktop = create<DesktopState>((set, get) => {
         } else {
           bridge.setPermissionMode(get().permissionMode);
         }
-        const sessionIndex = decorateSessions(loadJson<SessionMeta[]>("grox.sessionCatalog", []));
+        // Hydrate deleted-session / project hides before catalog / history import.
+        if (bridge.kind === "acp") {
+          await hydrateHiddenSessionsFromDisk();
+          await hydrateHiddenProjectsFromDisk();
+        }
+        const sessionIndex = filterHiddenSessions(
+          decorateSessions(loadJson<SessionMeta[]>("grox.sessionCatalog", [])),
+        );
         set({
           workspace,
-          projects,
+          projects: filterHiddenProjects(projects, loadHiddenProjectIds()),
           activeProjectId: projectId(workspace),
           sessionIndex,
           auth,
@@ -3361,6 +3448,8 @@ export const useDesktop = create<DesktopState>((set, get) => {
     async deleteSession(id) {
       // Tombstone first so late offline scan / in-flight openSession cannot resurrect.
       offlineHistoryDeleted.add(id);
+      // Persist hide so CLI history import / restart cannot resurrect (R-delete).
+      hideSessionId(id);
       pendingOfflineMerge.delete(id);
       releasePromptFlight(id);
       suppressNextIdleDrain.add(id);
@@ -3440,21 +3529,25 @@ export const useDesktop = create<DesktopState>((set, get) => {
       const current = get().sessionIndex.find((meta) => meta.id === id);
       const pinned = !current?.pinned;
       setSessionFlag(id, { pinned });
-      set({
-        sessionIndex: get().sessionIndex.map((meta) =>
-          meta.id === id ? { ...meta, pinned } : meta,
-        ),
-      });
+      const nextIndex = get().sessionIndex.map((meta) =>
+        meta.id === id ? { ...meta, pinned } : meta,
+      );
+      persistSessionCatalog(nextIndex);
+      set({ sessionIndex: nextIndex });
     },
 
     archiveSession(id) {
       const current = get().sessionIndex.find((meta) => meta.id === id);
       const archived = !current?.archived;
+      // Flags live in grox.sessionFlags (catalog strips archived on write).
       setSessionFlag(id, { archived });
+      const nextIndex = get().sessionIndex.map((meta) =>
+        meta.id === id ? { ...meta, archived } : meta,
+      );
+      // Keep catalog in sync for title/cwd; flags re-applied via decorateSessions on load.
+      persistSessionCatalog(nextIndex);
       set({
-        sessionIndex: get().sessionIndex.map((meta) =>
-          meta.id === id ? { ...meta, archived } : meta,
-        ),
+        sessionIndex: nextIndex,
         ...(get().activeId === id && archived ? { activeId: null, view: "home" as View } : {}),
       });
     },

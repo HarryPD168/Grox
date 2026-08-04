@@ -4940,6 +4940,58 @@ fn write_hidden_projects(ids: Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
+/// Sessions the operator deleted from the desktop sidebar (survive reinstall / CLI reimport).
+fn hidden_sessions_path() -> Result<PathBuf, String> {
+    Ok(grok_home()?.join("desktop-hidden-sessions.json"))
+}
+
+#[tauri::command]
+fn read_hidden_sessions() -> Result<Vec<String>, String> {
+    let path = hidden_sessions_path()?;
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    let raw = read_bounded_text(&path, MAX_CONFIG_BYTES)?;
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str(&raw).map_err(|error| format!("无法解析隐藏会话列表：{error}"))
+}
+
+#[tauri::command]
+fn write_hidden_sessions(ids: Vec<String>) -> Result<(), String> {
+    const MAX_HIDDEN_SESSIONS: usize = 2048;
+    const MAX_HIDDEN_ID_LEN: usize = 256;
+    if ids.len() > MAX_HIDDEN_SESSIONS {
+        return Err(format!(
+            "隐藏会话列表过长（最多 {MAX_HIDDEN_SESSIONS} 项）"
+        ));
+    }
+    let path = hidden_sessions_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("无法创建配置目录：{error}"))?;
+    }
+    let mut unique = ids
+        .into_iter()
+        .map(|id| id.trim().to_string())
+        .filter(|id| {
+            !id.is_empty()
+                && id.len() <= MAX_HIDDEN_ID_LEN
+                && !id.chars().any(char::is_control)
+        })
+        .collect::<Vec<_>>();
+    unique.sort();
+    unique.dedup();
+    if unique.len() > MAX_HIDDEN_SESSIONS {
+        unique.truncate(MAX_HIDDEN_SESSIONS);
+    }
+    let body = serde_json::to_string_pretty(&unique)
+        .map_err(|error| format!("无法序列化隐藏会话列表：{error}"))?;
+    atomic_write(&path, &body)?;
+    let _ = restrict_private_file(&path);
+    Ok(())
+}
+
 /// Local UI transcript cache — avoids waiting on full ACP `session/load` when
 /// switching missions. Stored under the app config dir (not the agent session tree).
 const SESSION_CACHE_MAX_BYTES: u64 = 12 * 1024 * 1024;
@@ -8296,6 +8348,8 @@ fn main() {
             write_config_document,
             read_hidden_projects,
             write_hidden_projects,
+            read_hidden_sessions,
+            write_hidden_sessions,
             read_session_cache,
             write_session_cache,
             preview_session_from_disk,
