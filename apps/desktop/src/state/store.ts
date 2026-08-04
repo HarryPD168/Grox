@@ -73,6 +73,7 @@ import {
   loadSessionCache,
   scheduleSaveSessionCache,
 } from "../lib/sessionCache";
+import { isPromptTurnTimeoutMessage } from "../lib/promptTurnTimeout";
 
 /** Missions whose offline disk history scan finished this process lifetime. */
 const offlineHistoryComplete = new Set<string>();
@@ -1587,9 +1588,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         // Surface turn-timeout reasons above the composer (R2 P0: bridge must emit
         // error before invalidate so this path runs; see withPromptTurnWatchdog).
         const isTurnTimeout =
-          !softQueueFail &&
-          !softCancel &&
-          /自动终止|无事件返回|小时上限|无新输出/.test(e.message);
+          !softQueueFail && !softCancel && isPromptTurnTimeoutMessage(e.message);
         if (isTurnTimeout) {
           // Park queue like Stop — auto-drain after FE kill is surprising (R2).
           suppressNextIdleDrain.add(e.sessionId);

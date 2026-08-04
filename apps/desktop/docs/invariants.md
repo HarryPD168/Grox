@@ -6,7 +6,7 @@ Must hold after every PR on the capability-migration track. Run:
 cd apps/desktop && pnpm test
 ```
 
-Focus suites: `permissionAuto`, `queueTurnPolicy`, `promptQueue`, `sessionGate`, `firstEventWatch`, `computerUse`, plus pure modules (`featureFlags`, `sandboxPolicy`, `effectiveRuntime`, `grokInspect`, `worktreePolicy`, `concurrentSessions`, `reviewPreset`, `activeProcesses`).
+Focus suites: `permissionAuto`, `queueTurnPolicy`, `promptQueue`, `sessionGate`, `firstEventWatch`, `promptTurnTimeout`, `computerUse`, plus pure modules (`featureFlags`, `sandboxPolicy`, `effectiveRuntime`, `grokInspect`, `worktreePolicy`, `concurrentSessions`, `reviewPreset`, `activeProcesses`).
 
 | ID | Invariant |
 |----|-----------|
@@ -18,6 +18,11 @@ Focus suites: `permissionAuto`, `queueTurnPolicy`, `promptQueue`, `sessionGate`,
 | I-06 | Failed worktree bind must not create a session with invalid cwd |
 | I-07 | Queue ghost / consumed semantics stay intact under new UI |
 | I-08 | Feature flag off ≈ pre-slice spawn / behavior |
+| I-09 | First-event budget SSOT: warm `FIRST_EVENT_STALL_MS` (25s); post-`session/load` one-shot `POST_BIND_FIRST_EVENT_MS` (60s); message seconds derive from the budget that fired |
+| I-10 | Primary prompt-turn timeout emits hard `error` **before** flight invalidate; store parks queue (no auto-drain) |
+| I-11 | Timeout classification uses `isPromptTurnTimeoutMessage` (no duplicate phrase lists in store) |
+| I-12 | Concurrent-only timeout under live primary must not force session idle |
+| I-13 | Live progress excludes `user_message_chunk` / mode-only updates (zero-event purity) |
 
 ## UI honesty
 

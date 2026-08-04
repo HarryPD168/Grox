@@ -8,10 +8,30 @@
  * mode was a red herring — gates show cards, not zero-event chrome.
  *
  * Mid-turn / long-tool policy lives in `promptTurnTimeout.ts` (sliding idle +
- * absolute ceiling). This constant is only the first-event phase.
+ * absolute ceiling). These constants are only the first-event phase.
+ *
+ * R3 / 0.2.15: large OLD sessions after silent rehydrate often need more than
+ * 25s for first live progress. Use POST_BIND budget one-shot after session/load;
+ * warm already-bound turns stay on FIRST_EVENT_STALL_MS.
  */
 
+/** Default first-event stall for warm / already-bound primaries. */
 export const FIRST_EVENT_STALL_MS = 25_000;
+
+/**
+ * One-shot first-event budget after a successful session/load rehydrate
+ * (silent first-send bind). Covers healthy post-bind TTFT without slowing
+ * true hang detection on subsequent warm turns.
+ */
+export const POST_BIND_FIRST_EVENT_MS = 60_000;
+
+/**
+ * Resolve the first-event budget for a primary prompt write.
+ * Pure helper — bridge passes `postBindGrace` for this write only (one-shot).
+ */
+export function resolveFirstEventMs(postBindGrace: boolean): number {
+  return postBindGrace ? POST_BIND_FIRST_EVENT_MS : FIRST_EVENT_STALL_MS;
+}
 
 export type BlockLike = {
   type: string;

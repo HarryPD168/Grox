@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { FIRST_EVENT_STALL_MS } from "./firstEventWatch";
+import { FIRST_EVENT_STALL_MS, POST_BIND_FIRST_EVENT_MS } from "./firstEventWatch";
 import {
   PROMPT_TURN_ABSOLUTE_MS,
   PROMPT_TURN_IDLE_MS,
@@ -61,13 +61,62 @@ describe("shouldExpirePromptTurn", () => {
     ).toBe("first_event");
   });
 
-  it("uses FIRST_EVENT_STALL_MS default", () => {
+  it("default firstEventMs tracks FIRST_EVENT_STALL_MS SSOT", () => {
     expect(FIRST_EVENT_STALL_MS).toBe(25_000);
     expect(
       shouldExpirePromptTurn({
         now: writtenAt + FIRST_EVENT_STALL_MS,
         writtenAt,
         lastActivityAt: 0,
+        hasOpenTools: false,
+      }),
+    ).toBe("first_event");
+    expect(
+      shouldExpirePromptTurn({
+        now: writtenAt + FIRST_EVENT_STALL_MS - 1,
+        writtenAt,
+        lastActivityAt: 0,
+        hasOpenTools: false,
+      }),
+    ).toBe("ok");
+  });
+
+  it("custom firstEventMs extends post-bind budget (R3)", () => {
+    expect(
+      shouldExpirePromptTurn({
+        now: writtenAt + 26_000,
+        writtenAt,
+        lastActivityAt: 0,
+        hasOpenTools: false,
+        firstEventMs: POST_BIND_FIRST_EVENT_MS,
+      }),
+    ).toBe("ok");
+    expect(
+      shouldExpirePromptTurn({
+        now: writtenAt + POST_BIND_FIRST_EVENT_MS - 1,
+        writtenAt,
+        lastActivityAt: 0,
+        hasOpenTools: false,
+        firstEventMs: POST_BIND_FIRST_EVENT_MS,
+      }),
+    ).toBe("ok");
+    expect(
+      shouldExpirePromptTurn({
+        now: writtenAt + POST_BIND_FIRST_EVENT_MS,
+        writtenAt,
+        lastActivityAt: 0,
+        hasOpenTools: false,
+        firstEventMs: POST_BIND_FIRST_EVENT_MS,
+      }),
+    ).toBe("first_event");
+  });
+
+  it("stale pre-write activity does not count as first event", () => {
+    expect(
+      shouldExpirePromptTurn({
+        now: writtenAt + FIRST_EVENT_STALL_MS,
+        writtenAt,
+        lastActivityAt: writtenAt - 1,
         hasOpenTools: false,
       }),
     ).toBe("first_event");
@@ -122,8 +171,14 @@ describe("shouldExpirePromptTurn", () => {
     ).toBe("absolute");
   });
 
-  it("messages are operator-facing Chinese", () => {
+  it("messages are operator-facing Chinese and derive first-event seconds", () => {
     expect(promptTurnTimeoutMessage("first_event")).toMatch(/自动终止/);
+    expect(promptTurnTimeoutMessage("first_event")).toMatch(
+      new RegExp(`${Math.round(FIRST_EVENT_STALL_MS / 1000)}s`),
+    );
+    expect(
+      promptTurnTimeoutMessage("first_event", { firstEventMs: POST_BIND_FIRST_EVENT_MS }),
+    ).toMatch(new RegExp(`${Math.round(POST_BIND_FIRST_EVENT_MS / 1000)}s`));
     expect(promptTurnTimeoutMessage("idle")).toMatch(/无新输出/);
     expect(promptTurnTimeoutMessage("absolute")).toMatch(/小时上限/);
   });
@@ -132,6 +187,11 @@ describe("shouldExpirePromptTurn", () => {
     for (const reason of ["first_event", "idle", "absolute"] as const) {
       expect(isPromptTurnTimeoutMessage(promptTurnTimeoutMessage(reason))).toBe(true);
     }
+    expect(
+      isPromptTurnTimeoutMessage(
+        promptTurnTimeoutMessage("first_event", { firstEventMs: POST_BIND_FIRST_EVENT_MS }),
+      ),
+    ).toBe(true);
     expect(isPromptTurnTimeoutMessage("回合已取消")).toBe(false);
     expect(isPromptTurnTimeoutMessage("队列提交已取消")).toBe(false);
   });

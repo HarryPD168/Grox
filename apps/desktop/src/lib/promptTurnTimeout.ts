@@ -7,11 +7,13 @@
  * with tools stuck "执行中", operator had to send a kick message.
  *
  * Policy:
- * 1) First-event stall (separate constant in firstEventWatch) — 0 events.
+ * 1) First-event stall (constants in firstEventWatch) — 0 events.
  * 2) After events: idle timeout only when no open tools (silent model hang).
  * 3) Absolute ceiling always (safety for zombies / silent long tools).
  * 4) Open tools suppress idle — long cargo tests emit nothing for a long time.
  */
+
+import { FIRST_EVENT_STALL_MS } from "./firstEventWatch";
 
 /** No session/update while tools are closed → treat as mid-turn model stall. */
 export const PROMPT_TURN_IDLE_MS = 45 * 60_000;
@@ -47,7 +49,7 @@ export function shouldExpirePromptTurn(args: {
   idleMs?: number;
   absoluteMs?: number;
 }): PromptTurnExpireReason {
-  const firstEventMs = args.firstEventMs ?? 25_000;
+  const firstEventMs = args.firstEventMs ?? FIRST_EVENT_STALL_MS;
   const idleMs = args.idleMs ?? PROMPT_TURN_IDLE_MS;
   const absoluteMs = args.absoluteMs ?? PROMPT_TURN_ABSOLUTE_MS;
 
@@ -71,6 +73,11 @@ export function isOpenToolStatus(status: string): boolean {
   return status === "pending" || status === "running" || status === "awaiting_permission";
 }
 
+export type PromptTurnTimeoutMessageOpts = {
+  /** Actual first-event budget that fired (warm 25s or post-bind 60s). */
+  firstEventMs?: number;
+};
+
 /**
  * Operator-facing timeout copy. Must include phrases matched by store
  * queueNotice / Timeline turnErrors (`自动终止|无事件返回|小时上限|无新输出`).
@@ -78,10 +85,16 @@ export function isOpenToolStatus(status: string): boolean {
  * Bridge expire must `emit({ type: "error", message })` **before**
  * `invalidatePromptFlights` so gen bump cannot swallow this (R2 P0).
  */
-export function promptTurnTimeoutMessage(reason: Exclude<PromptTurnExpireReason, "ok">): string {
+export function promptTurnTimeoutMessage(
+  reason: Exclude<PromptTurnExpireReason, "ok">,
+  opts?: PromptTurnTimeoutMessageOpts,
+): string {
   switch (reason) {
-    case "first_event":
-      return "Agent 超过 25s 无事件返回（常见于上一轮工具未结束）。已自动终止，可发消息重试。";
+    case "first_event": {
+      const ms = opts?.firstEventMs ?? FIRST_EVENT_STALL_MS;
+      const seconds = Math.max(1, Math.round(ms / 1000));
+      return `Agent 超过 ${seconds}s 无事件返回（常见于大会话绑定后首包较慢或上一轮工具未结束）。已自动终止，可发消息重试。`;
+    }
     case "idle":
       return `Agent 超过 ${Math.round(PROMPT_TURN_IDLE_MS / 60_000)} 分钟无新输出且无运行中工具。已自动终止，可发消息继续。`;
     case "absolute":
@@ -97,7 +110,7 @@ export function isPromptTurnTimeoutMessage(message: string): boolean {
 /**
  * session/update kinds that count as live turn progress for the sliding
  * first-event / idle clock. Excludes user_message_chunk echo and pure mode
- * updates so "0 条事件" hangs still hit the 25s first-event stall (R2).
+ * updates so "0 条事件" hangs still hit the first-event stall (R2/R3).
  */
 export const LIVE_TURN_PROGRESS_UPDATES = new Set([
   "agent_message_chunk",

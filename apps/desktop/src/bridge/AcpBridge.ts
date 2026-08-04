@@ -61,7 +61,7 @@ import {
   shouldAutoApproveToolPermission,
 } from "../lib/permissionAuto";
 import { shouldDropSilentInbound } from "../lib/silentAcp";
-import { FIRST_EVENT_STALL_MS } from "../lib/firstEventWatch";
+import { resolveFirstEventMs } from "../lib/firstEventWatch";
 import {
   PROMPT_TURN_POLL_MS,
   isLiveTurnProgressUpdate,
@@ -896,6 +896,12 @@ export class AcpBridge implements GrokBridge {
    */
   private liveTurnActivityAt = new Map<string, number>();
   /**
+   * One-shot post-`session/load` first-event grace (R3 / 0.2.15).
+   * Armed on successful load rehydrate; consumed on the next primary
+   * session/prompt write — not sticky across kills or warm re-sends.
+   */
+  private postBindGracePending = new Set<string>();
+  /**
    * toolCallIds still open (pending/running/awaiting_permission) per session.
    * Long silent tools (cargo test) suppress idle expire while this is non-empty.
    */
@@ -1095,6 +1101,7 @@ export class AcpBridge implements GrokBridge {
     this.replaying.delete(id);
     this.loadPromises.delete(id);
     this.liveTurnActivityAt.delete(id);
+    this.postBindGracePending.delete(id);
     this.openToolCallIds.delete(id);
     this.terminalToolCallIds.delete(id);
     this.primaryPromptSessions.delete(id);
@@ -1486,6 +1493,7 @@ export class AcpBridge implements GrokBridge {
     this.flightEpoch += 1;
     this.concurrentPromptGen.clear();
     this.liveTurnActivityAt.clear();
+    this.postBindGracePending.clear();
     this.openToolCallIds.clear();
     this.terminalToolCallIds.clear();
     // Dead agent cannot receive plan/permission answers — drop locks.
@@ -2840,9 +2848,15 @@ export class AcpBridge implements GrokBridge {
       concurrentGen: number | null;
       writtenAt: number;
       response: Promise<unknown>;
+      /**
+       * First-event budget for this flight (warm 25s or post-bind 60s).
+       * Captured at arm time — one-shot, not a sticky session flag.
+       */
+      firstEventMs?: number;
     },
   ): Promise<unknown> {
     const { primaryGen, concurrentGen, writtenAt, response } = opts;
+    const firstEventMs = opts.firstEventMs ?? resolveFirstEventMs(false);
     return new Promise<unknown>((resolve, reject) => {
       let settled = false;
       const finish = (fn: () => void) => {
@@ -2862,7 +2876,7 @@ export class AcpBridge implements GrokBridge {
       };
       const expire = (reason: Exclude<PromptTurnExpireReason, "ok">) => {
         finish(() => {
-          const message = promptTurnTimeoutMessage(reason);
+          const message = promptTurnTimeoutMessage(reason, { firstEventMs });
           const err = new Error(message);
           // Primary expire (or concurrent when no primary): cancel agent + clear tools.
           // Concurrent-only expire must NOT invalidate primary flights or session/cancel
@@ -2907,7 +2921,7 @@ export class AcpBridge implements GrokBridge {
           lastActivityAt: this.liveTurnActivityAt.get(sessionId) ?? 0,
           hasOpenTools: this.hasOpenTools(sessionId),
           hasOpenGate: this.hasOpenInteraction(sessionId),
-          firstEventMs: FIRST_EVENT_STALL_MS,
+          firstEventMs,
         });
         if (reason !== "ok") expire(reason);
       }, PROMPT_TURN_POLL_MS);
@@ -3846,6 +3860,9 @@ export class AcpBridge implements GrokBridge {
         return;
       }
       this.knownSessions.add(id);
+      // R3: next primary prompt gets one-shot post-rehydrate first-event grace.
+      // session/new must NOT arm this (empty context; keep warm 25s).
+      this.postBindGracePending.add(id);
       if (!this.permissionModeBySession.has(id)) {
         this.permissionModeBySession.set(id, this.permissionModeDefault);
       }
@@ -4236,11 +4253,15 @@ export class AcpBridge implements GrokBridge {
         // Only count activity after the wire write (pre_prompt_clear noise ignored).
         const writtenAt = Date.now();
         this.liveTurnActivityAt.set(sessionId, 0);
+        // Consume one-shot post-bind grace at this write only (R3). Retry after
+        // kill without re-bind falls back to warm 25s — not a sticky Set.
+        const postBindGrace = this.postBindGracePending.delete(sessionId);
         responsePromise = this.withPromptTurnWatchdog(sessionId, {
           primaryGen,
           concurrentGen: null,
           writtenAt,
           response: started.response,
+          firstEventMs: resolveFirstEventMs(postBindGrace),
         });
       });
 
@@ -4549,6 +4570,7 @@ export class AcpBridge implements GrokBridge {
       if (key.startsWith(`${id}:`)) this.activeComputerToolCalls.delete(key);
     }
     this.knownSessions.delete(id);
+    this.postBindGracePending.delete(id);
     this.cursors.delete(id);
     this.usage.delete(id);
     // Drop inflight load so a late loadSessionInner cannot re-bind a deleted id.
