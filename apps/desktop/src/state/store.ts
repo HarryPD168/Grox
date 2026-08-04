@@ -2681,10 +2681,18 @@ export const useDesktop = create<DesktopState>((set, get) => {
 
     async openSession(id) {
       // STABLE + COMPLETE HISTORY:
-      // - Opening NEVER calls ACP session/load (that freezes on 100MB+ updates.jsonl).
+      // - Opening NEVER does a full ACP *UI replay* (that freezes on 100MB+ updates.jsonl).
       // - Instant paint from memory / chat_history / UI cache.
       // - Background Rust thread streams updates.jsonl (skips thoughts, cancelable).
-      // - Agent bind still happens only on first send (model context).
+      // - 0.2.16: silent *agent* warm-bind on open (enqueueBackgroundLoad) so first
+      //   send does not wait minutes for session/load. Still silent-only; no UI flood.
+      const kickWarmAgentBind = (sessionId: string) => {
+        if (bridge.kind !== "acp") return;
+        if (offlineHistoryDeleted.has(sessionId)) return;
+        if (bridge.isSessionBound?.(sessionId)) return;
+        // Priority queue: active unbound first; silent load only.
+        bridge.enqueueBackgroundLoad?.(sessionId);
+      };
       try {
         const current = get();
         if (current.activeId === id && current.sessions[id] && current.view === "session") {
@@ -2717,6 +2725,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
             set({ fullHistoryLoadingId: id, historyLoadMode: "disk" });
             startOfflineScanPoll(id);
           }
+          kickWarmAgentBind(id);
           return;
         }
 
@@ -2892,6 +2901,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
           if (needRescan) offlineHistoryComplete.delete(id);
           applyChrome(has, { loadingDisk: needRescan });
           kickOfflineHistory(has);
+          kickWarmAgentBind(id);
           return;
         }
 
@@ -2913,11 +2923,13 @@ export const useDesktop = create<DesktopState>((set, get) => {
                   applyChrome(transcript, { loadingDisk: true });
                   scheduleSaveSessionCache(transcript);
                   kickOfflineHistory(transcript);
+                  kickWarmAgentBind(id);
                   return;
                 }
                 offlineHistoryComplete.add(id);
                 applyChrome(transcript, { loadingDisk: false });
                 scheduleSaveSessionCache(transcript);
+                kickWarmAgentBind(id);
                 return;
               }
             }
@@ -2941,6 +2953,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
             if (preview && preview.id === id && preview.blocks.length > 0) {
               applyChrome(preview, { loadingDisk: true });
               kickOfflineHistory(preview);
+              kickWarmAgentBind(id);
               return;
             }
           }
@@ -2955,6 +2968,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         if (cached) {
           applyChrome(cached, { loadingDisk: !offlineHistoryComplete.has(id) });
           kickOfflineHistory(cached);
+          kickWarmAgentBind(id);
           return;
         }
 
@@ -2977,6 +2991,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
           : null;
         applyChrome(shell, { loadingDisk: true });
         kickOfflineHistory(shell);
+        // New empty missions usually come from session/new (already bound).
+        // Warm bind is a no-op when isSessionBound; safe if catalogue seed only.
+        kickWarmAgentBind(id);
       } catch (error) {
         set({
           startupError: error instanceof Error ? error.message : String(error),

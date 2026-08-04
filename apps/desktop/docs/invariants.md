@@ -23,6 +23,8 @@ Focus suites: `permissionAuto`, `queueTurnPolicy`, `promptQueue`, `sessionGate`,
 | I-11 | Timeout classification uses `isPromptTurnTimeoutMessage` (no duplicate phrase lists in store) |
 | I-12 | Concurrent-only timeout under live primary must not force session idle |
 | I-13 | Live progress excludes `user_message_chunk` / mode-only updates (zero-event purity) |
+| I-14 | Open session may silent warm-bind the **active** mission only (no UI replay flood); first-send awaits the same `loadPromises` if still in flight |
+| I-15 | Background silent bind must not start while a live primary/concurrent turn is bookkept |
 
 ## UI honesty
 

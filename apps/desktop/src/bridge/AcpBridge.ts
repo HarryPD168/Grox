@@ -1204,6 +1204,16 @@ export class AcpBridge implements GrokBridge {
           continue;
         }
 
+        // R3/0.2.16: do not start a NEW silent bind while a live turn is
+        // bookkept — exclusive channel + agent context should serve the turn.
+        // (In-flight load for the same id is fine: first-send awaits loadPromises.)
+        const liveTurn =
+          this.primaryPromptSessions.size > 0 ||
+          [...this.concurrentPromptCount.values()].some((n) => n > 0);
+        if (liveTurn) {
+          break;
+        }
+
         this.backgroundLoadInFlight = id;
         try {
           // Silent bind only — offline disk history already covers viewing.
@@ -2665,6 +2675,8 @@ export class AcpBridge implements GrokBridge {
     this.resetTurnRetryState(this.cursor(sessionId));
     if (usageValue) this.emitUsage(sessionId, usageValue);
     this.emit({ type: "status", sessionId, status: "idle" });
+    // Resume warm-binds deferred while a live turn held the channel (0.2.16).
+    void this.pumpBackgroundLoads();
   }
 
   /** Start a JSON-RPC request; resolve only after the line is written (not the result). */
