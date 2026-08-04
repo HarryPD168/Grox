@@ -129,6 +129,11 @@ const consumedConcurrentTextsBySession = new Map<string, Set<string>>();
  * next idle tick — otherwise sendPrompt `finally` / late idle races re-fire.
  */
 const suppressNextIdleDrain = new Set<string>();
+/**
+ * Per-session drain mutex — finishTurn idle + prompt_complete can schedule two
+ * drains in one tick and dual-send the same queue row (R2).
+ */
+const drainInFlight = new Set<string>();
 
 /** True when this send IIFE was superseded by Stop / a newer primary. */
 function isPromptFlightCancelled(sessionId: string, flightGen: number): boolean {
@@ -1170,11 +1175,21 @@ function patchTool(
   blockId: string,
   call: Partial<ToolCall>,
 ): SessionBlock[] {
-  return blocks.map((b) =>
-    b.id === blockId && b.type === "tool"
-      ? { ...b, call: { ...b.call, ...call } as ToolCall }
-      : b,
-  );
+  return blocks.map((b) => {
+    if (b.id !== blockId || b.type !== "tool") return b;
+    const prev = b.call.status;
+    const next = call.status;
+    // Terminal tools stay terminal unless an explicit force (cancelled after abort
+    // with detail is allowed: cancelled over done is rare; running over done is not).
+    const prevTerminal = prev === "done" || prev === "error" || prev === "cancelled";
+    const reopen =
+      next === "pending" || next === "running" || next === "awaiting_permission";
+    if (prevTerminal && next !== undefined && reopen) {
+      const { status: _drop, endedAt: _e, ...rest } = call;
+      return { ...b, call: { ...b.call, ...rest } as ToolCall };
+    }
+    return { ...b, call: { ...b.call, ...call } as ToolCall };
+  });
 }
 
 export const useDesktop = create<DesktopState>((set, get) => {
@@ -1539,22 +1554,72 @@ export const useDesktop = create<DesktopState>((set, get) => {
         // Defense: queue soft-fails must not force idle over a live turn.
         // (Bridge now prefers emitSoftError for concurrent queue failures.)
         const softQueueFail = e.message.startsWith("队列消息失败");
+        // Soft cancel after Stop / supersede — do not force idle over a newer flight.
+        const softCancel =
+          /回合已取消|队列提交已取消/.test(e.message) && !/超时|自动终止/.test(e.message);
         withSession(e.sessionId, (s) => {
           const live =
-            softQueueFail &&
+            (softQueueFail || softCancel) &&
             (s.status === "running" ||
               s.status === "awaiting_permission" ||
               s.status === "awaiting_input");
           return {
             ...s,
-            ...(live ? {} : { status: "idle" as const }),
-            blocks: [
-              ...s.blocks,
-              { type: "system", id: uid(), text: e.message, ts: Date.now(), kind: "error" },
-            ],
+            ...(live || softCancel ? {} : { status: "idle" as const }),
+            blocks: softCancel
+              ? s.blocks
+              : [
+                  ...s.blocks,
+                  { type: "system", id: uid(), text: e.message, ts: Date.now(), kind: "error" },
+                ],
           };
         });
-        if (!softQueueFail) {
+        // Surface turn-timeout reasons above the composer (R2 P0: bridge must emit
+        // error before invalidate so this path runs; see withPromptTurnWatchdog).
+        const isTurnTimeout =
+          !softQueueFail &&
+          !softCancel &&
+          /自动终止|无事件返回|小时上限|无新输出/.test(e.message);
+        if (isTurnTimeout) {
+          // Park queue like Stop — auto-drain after FE kill is surprising (R2).
+          suppressNextIdleDrain.add(e.sessionId);
+          const n = (get().promptQueues[e.sessionId] ?? []).length;
+          set({
+            queueNotice: {
+              id: uid(),
+              message:
+                n > 0
+                  ? tOp(
+                      `${e.message}（队列仍保留 ${n} 条，不会自动发送）`,
+                      `${e.message} (${n} queue item(s) kept — will not auto-send)`,
+                    )
+                  : e.message,
+              state: "blocked",
+              at: Date.now(),
+            },
+          });
+        }
+        if (!softQueueFail && !softCancel) {
+          // Force-cancel any tool cards still running (bridge open-set may miss).
+          withSession(e.sessionId, (s) => ({
+            ...s,
+            blocks: s.blocks.map((block) => {
+              if (block.type !== "tool") return block;
+              const st = block.call.status;
+              if (st !== "running" && st !== "pending" && st !== "awaiting_permission") {
+                return block;
+              }
+              return {
+                ...block,
+                call: {
+                  ...block.call,
+                  status: "cancelled" as const,
+                  endedAt: Date.now(),
+                  detail: block.call.detail ?? e.message,
+                },
+              };
+            }),
+          }), false);
           releasePromptFlight(e.sessionId);
           // Invalidate concurrent IIFEs for this mission (agent may be dead/restarting).
           bumpConcurrentEnqueueEpoch(e.sessionId);
@@ -1564,7 +1629,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
             // drain/reconnect can re-send; drop pure CLI ghosts only.
             rehomeHeldQueueForRecovery(e.sessionId);
             flushPendingOfflineMerge(e.sessionId);
-            // Respect Stop-suppress (same as status→idle).
+            // Respect Stop-suppress / timeout park (same as status→idle).
             drainPromptQueue(e.sessionId);
           }, 0);
         }
@@ -1915,45 +1980,58 @@ export const useDesktop = create<DesktopState>((set, get) => {
       return;
     }
 
-    // Operator Stop: park queue until they re-send or clear (all drain callers).
+    // Operator Stop / FE auto-timeout: park queue until they re-send or clear.
     if (suppressNextIdleDrain.has(sessionId)) {
       return;
     }
 
-    // Prefer interjected, then first local-owned entry that is not mid concurrent
-    // write. Do NOT delete submitted/sending rows — a failed write restores them
-    // to `queued`; dropping here made follow-ups vanish permanently.
-    const localIndex = queue.findIndex(
-      (item) =>
-        item.source !== "cli" &&
-        item.state !== "sending" &&
-        !item.heldByCli &&
-        !submittedEnqueueIds.has(item.id),
-    );
-    if (localIndex < 0) {
-      // Only CLI / in-flight concurrent rows remain — leave them alone.
-      return;
-    }
+    // Mutex: dual idle events in one tick must not dual-send (R2).
+    if (drainInFlight.has(sessionId)) return;
+    drainInFlight.add(sessionId);
+    try {
+      // Re-read after claiming the lock — another drain may have emptied the queue.
+      const latest = get().promptQueues[sessionId] ?? [];
+      if (get().sessions[sessionId]?.status !== "idle" || latest.length === 0) {
+        return;
+      }
 
-    const next = queue[localIndex];
-    const rest = queue.filter((_, index) => index !== localIndex);
-    set({
-      promptQueues: {
-        ...get().promptQueues,
-        [sessionId]: rest,
-      },
-      queueNotice: {
-        id: uid(),
-        entryId: next.id,
-        message:
-          next.state === "interjected"
-            ? tOp("正在发送插话优先消息…", "Sending interject-first message…")
-            : tOp("正在发送队首消息…", "Sending queue head…"),
-        state: "queued",
-        at: Date.now(),
-      },
-    });
-    get().sendPrompt(next.text, next.attachments, sessionId);
+      // Prefer interjected, then first local-owned entry that is not mid concurrent
+      // write. Do NOT delete submitted/sending rows — a failed write restores them
+      // to `queued`; dropping here made follow-ups vanish permanently.
+      const localIndex = latest.findIndex(
+        (item) =>
+          item.source !== "cli" &&
+          item.state !== "sending" &&
+          !item.heldByCli &&
+          !submittedEnqueueIds.has(item.id),
+      );
+      if (localIndex < 0) {
+        // Only CLI / in-flight concurrent rows remain — leave them alone.
+        return;
+      }
+
+      const next = latest[localIndex];
+      const rest = latest.filter((_, index) => index !== localIndex);
+      set({
+        promptQueues: {
+          ...get().promptQueues,
+          [sessionId]: rest,
+        },
+        queueNotice: {
+          id: uid(),
+          entryId: next.id,
+          message:
+            next.state === "interjected"
+              ? tOp("正在发送插话优先消息…", "Sending interject-first message…")
+              : tOp("正在发送队首消息…", "Sending queue head…"),
+          state: "queued",
+          at: Date.now(),
+        },
+      });
+      get().sendPrompt(next.text, next.attachments, sessionId);
+    } finally {
+      drainInFlight.delete(sessionId);
+    }
   };
 
   /**

@@ -329,6 +329,12 @@ function TurnGroup({ turn, sessionId, status, active }: TurnGroupProps) {
   }
 
   const unresolved = turn.blocks.filter((block) => (block.type === "permission" && !block.resolved) || (block.type === "question" && !block.response));
+  // Turn-end errors (e.g. session/prompt timeout) must stay visible outside the
+  // collapsed「已处理」fold — operators reported 就绪 with no Stop and no reason.
+  const turnErrors = turn.blocks.filter(
+    (block): block is Extract<SessionBlock, { type: "system" }> =>
+      block.type === "system" && block.kind === "error",
+  );
   // Agent turns emit many assistant segments (narration between tools). The wire
   // closes each segment before the next tool, so only showing assistants.at(-1)
   // hides most of the answer inside the collapsed "Processed" fold.
@@ -342,8 +348,10 @@ function TurnGroup({ turn, sessionId, status, active }: TurnGroupProps) {
       block !== user &&
       block.type !== "assistant" &&
       !(block.type === "user" && block.interjected) &&
-      !unresolved.includes(block),
+      !unresolved.includes(block) &&
+      !(block.type === "system" && block.kind === "error"),
   );
+  const turnHadError = turnErrors.length > 0;
   const toolCount = process.filter((block) => block.type === "tool").length;
   const thoughts = process.filter((block): block is Extract<SessionBlock, { type: "thinking" }> => block.type === "thinking");
   const thoughtCount = thoughts.length;
@@ -411,7 +419,9 @@ function TurnGroup({ turn, sessionId, status, active }: TurnGroupProps) {
           <Icon name={processOpen ? "chevronDown" : "chevronRight"} size={9} className="shrink-0 text-dim" />
           <span className="shrink-0 text-[10.5px] font-medium text-fg2">{language === "zh-CN" ? "已处理" : "Processed"}</span>
           <span className="min-w-0 flex-1 truncate text-[10px] text-dim" title={processSummary}>{processSummary}{elapsed ? ` · ${(elapsed / 1000).toFixed(1)}s` : ""}</span>
-          <Icon name="check" size={9} className="text-green" />
+          {turnHadError
+            ? <Icon name="x" size={9} className="text-red" />
+            : <Icon name="check" size={9} className="text-green" />}
         </button>
         {processOpen && (
           <div className="process-sequence process-rail ml-[7px] mt-2 border-l border-line2 pb-1 pl-5 pt-2">
@@ -424,6 +434,7 @@ function TurnGroup({ turn, sessionId, status, active }: TurnGroupProps) {
         )}
         {turnElapsed > 0 && <div className="turn-elapsed"><span>{language === "zh-CN" ? `已处理 ${turnElapsed < 1000 ? `${turnElapsed}ms` : `${(turnElapsed / 1000).toFixed(turnElapsed < 10_000 ? 1 : 0)}s`}` : `Processed in ${(turnElapsed / 1000).toFixed(1)}s`}</span><i /></div>}
       </div>
+      {turnErrors.map((block) => renderBlock(block, sessionId))}
       {unresolved.map((block) => renderBlock(block, sessionId))}
       {interjections.map((block) => (
         <UserMsg key={block.id} block={block} canEdit={false} />

@@ -36,10 +36,13 @@ export function QuestionCard({
   const zh = language === "zh-CN";
   const resolveQuestion = useDesktop((state) => state.resolveQuestion);
   // Only the top unresolved interview is interactive when several stack.
+  // Require awaiting_input (parity with PermissionCard) so cards are not
+  // clickable after idle/timeout if resolve events were missed (R2).
   const isTopPending = useDesktop((s) => {
     if (s.activeId !== sessionId) return false;
     const session = s.sessions[sessionId];
     if (!session) return false;
+    if (session.status !== "awaiting_input") return false;
     if (block.response) return false;
     return topPendingQuestionId(session) === block.id;
   });

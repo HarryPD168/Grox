@@ -6,6 +6,9 @@
  * sent from AUTO mode; UI painted running + user bubble; no further
  * user_message_chunk landed on disk until session/cancel (Stop). Permission
  * mode was a red herring — gates show cards, not zero-event chrome.
+ *
+ * Mid-turn / long-tool policy lives in `promptTurnTimeout.ts` (sliding idle +
+ * absolute ceiling). This constant is only the first-event phase.
  */
 
 export const FIRST_EVENT_STALL_MS = 25_000;

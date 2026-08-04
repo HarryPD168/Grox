@@ -62,6 +62,14 @@ import {
 } from "../lib/permissionAuto";
 import { shouldDropSilentInbound } from "../lib/silentAcp";
 import { FIRST_EVENT_STALL_MS } from "../lib/firstEventWatch";
+import {
+  PROMPT_TURN_POLL_MS,
+  isLiveTurnProgressUpdate,
+  isOpenToolStatus,
+  promptTurnTimeoutMessage,
+  shouldExpirePromptTurn,
+  type PromptTurnExpireReason,
+} from "../lib/promptTurnTimeout";
 
 export const ACP_METHODS = {
   initialize: "initialize",
@@ -127,6 +135,8 @@ interface PendingRequest {
   reject(error: Error): void;
   method: string;
   timeoutId?: number;
+  /** Optional session scope so cancel/expire can hard-settle session/prompt. */
+  sessionId?: string;
 }
 
 interface ContentCursor {
@@ -539,7 +549,14 @@ interface ComputerSessionExtensions {
   leaseId: string;
 }
 
-function mapToolStatus(value: unknown): ToolStatus {
+/**
+ * Map wire tool status. Returns `undefined` when status is missing/unknown so
+ * content-only tool_call_update patches do not re-open closed tools as "running"
+ * (Rust offline history defaults missing status to done — opposite of inventing
+ * running). Initial tool_call without status still defaults to running at call site.
+ */
+function mapToolStatus(value: unknown): ToolStatus | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
   switch ((string(value) ?? "").toLowerCase()) {
     case "pending":
       return "pending";
@@ -561,7 +578,8 @@ function mapToolStatus(value: unknown): ToolStatus {
     case "rejected":
       return "cancelled";
     default:
-      return "running";
+      // Unknown strings: do not invent "running" (would poison openToolCallIds).
+      return undefined;
   }
 }
 
@@ -871,9 +889,20 @@ export class AcpBridge implements GrokBridge {
   }
   /**
    * Wall clock of the last live session/update (or gate request) while a primary
-   * prompt is open. Used to detect "0 条事件" stalls after session/prompt write.
+   * prompt is open. Used to detect "0 条事件" stalls after session/prompt write
+   * and mid-turn idle (see promptTurnTimeout).
    */
   private liveTurnActivityAt = new Map<string, number>();
+  /**
+   * toolCallIds still open (pending/running/awaiting_permission) per session.
+   * Long silent tools (cargo test) suppress idle expire while this is non-empty.
+   */
+  private openToolCallIds = new Map<string, Set<string>>();
+  /**
+   * toolCallIds that reached a terminal status this process life (per session).
+   * Blocks late open statuses from re-poisoning openToolCallIds (R2).
+   */
+  private terminalToolCallIds = new Map<string, Set<string>>();
   /**
    * Sessions deleted this process lifetime — late session/load must not re-bind
    * or re-emit into the store after the operator removed the mission.
@@ -1439,6 +1468,8 @@ export class AcpBridge implements GrokBridge {
     this.flightEpoch += 1;
     this.concurrentPromptGen.clear();
     this.liveTurnActivityAt.clear();
+    this.openToolCallIds.clear();
+    this.terminalToolCallIds.clear();
     // Dead agent cannot receive plan/permission answers — drop locks.
     this.resolvedPlanDecisions.clear();
     this.resolvedPlanByBlock.clear();
@@ -2098,13 +2129,27 @@ export class AcpBridge implements GrokBridge {
     });
   }
 
-  /** Record that the agent produced a live turn signal (stream or gate). */
-  private noteLiveTurnActivity(sessionId: string): void {
-    if (
+  /** True while a primary or concurrent session/prompt is bookkept as live. */
+  private isTurnFlightLive(sessionId: string): boolean {
+    return (
       this.primaryPromptSessions.has(sessionId) ||
       (this.concurrentPromptCount.get(sessionId) ?? 0) > 0
-    ) {
+    );
+  }
+
+  /** Record that the agent produced a live turn signal (stream or gate). */
+  private noteLiveTurnActivity(sessionId: string): void {
+    if (this.isTurnFlightLive(sessionId)) {
       this.liveTurnActivityAt.set(sessionId, Date.now());
+    }
+  }
+
+  /** Best-effort sticky-stop Computer Use when a turn is killed (Stop / timeout). */
+  private stickyStopComputerIfNeeded(sessionId: string): void {
+    const leaseId = this.computerLeases.get(sessionId);
+    if (!leaseId && !this.activeComputerSessions.has(sessionId)) return;
+    if (leaseId) {
+      void invoke("computer_emergency_stop", { leaseId }).catch(() => {});
     }
   }
 
@@ -2114,7 +2159,12 @@ export class AcpBridge implements GrokBridge {
       const sessionId = string(params?.sessionId);
       if (sessionId && this.silentReplaying.has(sessionId)) return;
       if (sessionId) {
-        this.noteLiveTurnActivity(sessionId);
+        // Activity only for real progress (not every session/update) — R2.
+        const update = record(params?.update);
+        const kind = string(update?.sessionUpdate);
+        if (isLiveTurnProgressUpdate(kind)) {
+          this.noteLiveTurnActivity(sessionId);
+        }
         this.handleSessionUpdate(sessionId, params?.update);
       }
       return;
@@ -2303,10 +2353,21 @@ export class AcpBridge implements GrokBridge {
         return;
       }
       case "tool_call":
+        // Drop late tools after turn settle (cancel/timeout) so UI stays 就绪
+        // without resurrected 执行中 cards (R2).
+        if (!this.isTurnFlightLive(sessionId) && !this.replaying.has(sessionId)) {
+          return;
+        }
         this.closeUser(sessionId);
         this.addTool(sessionId, update);
         return;
       case "tool_call_update":
+        if (!this.isTurnFlightLive(sessionId) && !this.replaying.has(sessionId)) {
+          // Allow terminal status to close chrome if we still track the id;
+          // never open new tools after the flight died.
+          const lateStatus = mapToolStatus(update.status);
+          if (lateStatus === undefined || isOpenToolStatus(lateStatus)) return;
+        }
         this.patchTool(sessionId, update);
         return;
       case "plan": {
@@ -2341,13 +2402,15 @@ export class AcpBridge implements GrokBridge {
     cursor.toolBlocks.set(toolCallId, blockId);
     const content = array(update.content);
     const kind = mapToolKind(update.kind, update.title);
+    // Initial tool_call: missing status means in progress (open).
+    const status = mapToolStatus(update.status) ?? "running";
     const call: ToolCall = {
       id: toolCallId,
       kind,
       rawKind: string(update.kind),
       title: string(update.title) ?? "tool",
       detail: string(update.detail),
-      status: mapToolStatus(update.status),
+      status,
       startedAt: Date.now(),
       input: jsonText(update.rawInput),
       output: toolOutputText(update.rawOutput, content),
@@ -2366,6 +2429,7 @@ export class AcpBridge implements GrokBridge {
       this.activeComputerToolCalls.add(`${sessionId}:${toolCallId}`);
       this.activeComputerSessions.add(sessionId);
     }
+    this.noteToolLifecycle(sessionId, toolCallId, call.status);
     this.emit({
       type: "block_add",
       sessionId,
@@ -2383,6 +2447,7 @@ export class AcpBridge implements GrokBridge {
       blockId = cursor.toolBlocks.get(toolCallId);
       if (!blockId) return;
     }
+    // Content-only updates often omit status — do not invent "running".
     const status = mapToolStatus(update.status);
     const content = array(update.content);
     const terminal = extractTerminal(
@@ -2395,7 +2460,7 @@ export class AcpBridge implements GrokBridge {
     const kind = mapToolKind(update.kind, update.title);
     const computerToolKey = `${sessionId}:${toolCallId}`;
     const isComputerTool = kind === "computer" || this.activeComputerToolCalls.has(computerToolKey);
-    if (isComputerTool) {
+    if (status !== undefined && isComputerTool) {
       if (status === "running") {
         this.activeComputerToolCalls.add(computerToolKey);
         this.activeComputerSessions.add(sessionId);
@@ -2406,6 +2471,9 @@ export class AcpBridge implements GrokBridge {
         }
       }
     }
+    if (status !== undefined) {
+      this.noteToolLifecycle(sessionId, toolCallId, status);
+    }
     const locations = extractLocations(update.locations, update.rawInput, update.rawOutput, content);
     this.queueToolPatch({
       type: "tool_patch",
@@ -2414,7 +2482,7 @@ export class AcpBridge implements GrokBridge {
       call: {
         ...(update.kind !== undefined || update.title !== undefined ? { kind } : {}),
         ...(update.kind !== undefined ? { rawKind: string(update.kind) } : {}),
-        status,
+        ...(status !== undefined ? { status } : {}),
         ...(status === "done" || status === "error" || status === "cancelled" ? { endedAt: Date.now() } : {}),
         ...(update.title !== undefined ? { title: string(update.title) } : {}),
         ...(update.detail !== undefined ? { detail: string(update.detail) } : {}),
@@ -2558,9 +2626,15 @@ export class AcpBridge implements GrokBridge {
       }
       return;
     }
+    // Idle without resolving gates leaves Allow/Submit clickable (R2 security).
+    if (this.hasOpenInteraction(sessionId)) {
+      this.resolveOpenInteractions(sessionId);
+    }
     this.closeUser(sessionId);
     this.closeThinking(sessionId);
     this.closeAssistant(sessionId);
+    // Healthy turn end with orphan tool cards → cancel them (no permanent 执行中).
+    this.abortOpenTools(sessionId, "回合已结束");
     this.flushToolPatches(sessionId);
     this.resetTurnRetryState(this.cursor(sessionId));
     if (usageValue) this.emitUsage(sessionId, usageValue);
@@ -2572,6 +2646,7 @@ export class AcpBridge implements GrokBridge {
     method: string,
     params: unknown,
     timeoutMs: number,
+    sessionId?: string,
   ): { rpcId: number; response: Promise<unknown>; written: Promise<void> } {
     const rpcId = ++this.requestId;
     const response = new Promise<unknown>((resolve, reject) => {
@@ -2579,6 +2654,7 @@ export class AcpBridge implements GrokBridge {
         resolve,
         reject,
         method,
+        sessionId,
         timeoutId:
           timeoutMs > 0
             ? window.setTimeout(() => {
@@ -2606,17 +2682,149 @@ export class AcpBridge implements GrokBridge {
     return { rpcId, response, written };
   }
 
+  private hasOpenTools(sessionId: string): boolean {
+    const set = this.openToolCallIds.get(sessionId);
+    return Boolean(set && set.size > 0);
+  }
+
+  /** Track tool open/close so long silent tools suppress idle expire. */
+  private noteToolLifecycle(sessionId: string, toolCallId: string, status: ToolStatus): void {
+    let terminal = this.terminalToolCallIds.get(sessionId);
+    if (isOpenToolStatus(status)) {
+      // Terminal latch: do not re-open after done/error/cancelled (R2).
+      if (terminal?.has(toolCallId)) return;
+      let set = this.openToolCallIds.get(sessionId);
+      if (!set) {
+        set = new Set();
+        this.openToolCallIds.set(sessionId, set);
+      }
+      set.add(toolCallId);
+      return;
+    }
+    // Terminal: latch + remove from open.
+    if (!terminal) {
+      terminal = new Set();
+      this.terminalToolCallIds.set(sessionId, terminal);
+    }
+    terminal.add(toolCallId);
+    const set = this.openToolCallIds.get(sessionId);
+    if (!set) return;
+    set.delete(toolCallId);
+    if (set.size === 0) this.openToolCallIds.delete(sessionId);
+  }
+
+  /** Reject in-flight session/prompt (and related) RPCs for a session. */
+  private rejectPendingForSession(sessionId: string, error: Error): void {
+    for (const [rpcId, pending] of [...this.pending.entries()]) {
+      if (pending.sessionId !== sessionId) continue;
+      if (pending.method !== ACP_METHODS.sessionPrompt && pending.method !== "session/prompt") {
+        // Only hard-settle turn RPCs; leave short control RPCs alone.
+        continue;
+      }
+      this.pending.delete(rpcId);
+      if (pending.timeoutId !== undefined) window.clearTimeout(pending.timeoutId);
+      pending.reject(error);
+    }
+  }
+
   /**
-   * After session/prompt is on the wire: if the agent never emits a live update
-   * (or gate) within FIRST_EVENT_STALL_MS, auto session/cancel and fail the
-   * turn so the UI leaves "0 条事件" without requiring manual Stop.
+   * Close open permission/plan/question cards (parity with user Stop).
+   * Timeout must not leave gates clickable after idle.
    */
-  private withFirstEventWatchdog(
+  private resolveOpenInteractions(sessionId: string): void {
+    for (const [blockId, interaction] of this.interactions) {
+      if (interaction.sessionId !== sessionId) continue;
+      this.interactions.delete(blockId);
+      if (interaction.kind === "permission" || interaction.kind === "plan") {
+        this.emit({
+          type: "permission_resolved",
+          sessionId,
+          blockId,
+          option: "deny",
+        });
+      } else if (interaction.kind === "question") {
+        this.emit({
+          type: "question_resolved",
+          sessionId,
+          blockId,
+          response: { outcome: "cancelled" },
+        });
+      }
+      const result =
+        interaction.kind === "permission"
+          ? { outcome: { outcome: "cancelled" } }
+          : { outcome: "cancelled" };
+      void this.sendRaw({ jsonrpc: "2.0", id: interaction.rpcId, result });
+    }
+  }
+
+  /**
+   * Mark tools still open as cancelled so UI does not leave permanent 「执行中」
+   * after FE timeout / cancel (evidence: session/prompt 900s kill).
+   * Only open / computer-active ids — never rewrite already-done tools.
+   */
+  private abortOpenTools(sessionId: string, detail: string): void {
+    const cursor = this.cursor(sessionId);
+    const endedAt = Date.now();
+    const ids = new Set<string>([...(this.openToolCallIds.get(sessionId) ?? [])]);
+    for (const key of [...this.activeComputerToolCalls]) {
+      if (key.startsWith(`${sessionId}:`)) {
+        ids.add(key.slice(sessionId.length + 1));
+      }
+    }
+    if (ids.size === 0) {
+      this.openToolCallIds.delete(sessionId);
+      return;
+    }
+    let terminal = this.terminalToolCallIds.get(sessionId);
+    if (!terminal) {
+      terminal = new Set();
+      this.terminalToolCallIds.set(sessionId, terminal);
+    }
+    for (const toolCallId of ids) {
+      const blockId = cursor.toolBlocks.get(toolCallId);
+      if (blockId) {
+        this.queueToolPatch({
+          type: "tool_patch",
+          sessionId,
+          blockId,
+          call: {
+            status: "cancelled",
+            endedAt,
+            detail,
+          },
+        });
+      }
+      terminal.add(toolCallId);
+      this.activeComputerToolCalls.delete(`${sessionId}:${toolCallId}`);
+    }
+    if (![...this.activeComputerToolCalls].some((key) => key.startsWith(`${sessionId}:`))) {
+      this.activeComputerSessions.delete(sessionId);
+    }
+    this.openToolCallIds.delete(sessionId);
+    this.flushToolPatches(sessionId);
+  }
+
+  /**
+   * Watch session/prompt for the full turn life:
+   * - first-event stall (0 events)
+   * - mid-turn idle (no events + no open tools)
+   * - absolute wall-clock ceiling
+   *
+   * Replaces the old fixed 15-minute beginRequest timer that killed healthy
+   * multi-tool turns at exactly 900s.
+   */
+  private withPromptTurnWatchdog(
     sessionId: string,
-    primaryGen: number,
-    writtenAt: number,
-    response: Promise<unknown>,
+    opts: {
+      /** Primary gen, or null when watching a concurrent flight. */
+      primaryGen: number | null;
+      concurrentGen: number | null;
+      writtenAt: number;
+      response: Promise<unknown>;
+    },
   ): Promise<unknown> {
+    const { primaryGen, concurrentGen, writtenAt, response } = opts;
     return new Promise<unknown>((resolve, reject) => {
       let settled = false;
       const finish = (fn: () => void) => {
@@ -2625,38 +2833,81 @@ export class AcpBridge implements GrokBridge {
         window.clearInterval(timer);
         fn();
       };
-      const timer = window.setInterval(() => {
-        if (this.primaryPromptGen.get(sessionId) !== primaryGen) {
-          finish(() => {
-            /* superseded — leave response orphaned */
-          });
-          return;
+      const stillCurrent = (): boolean => {
+        if (primaryGen !== null && this.primaryPromptGen.get(sessionId) !== primaryGen) {
+          return false;
         }
-        const activity = this.liveTurnActivityAt.get(sessionId) ?? 0;
-        if (activity >= writtenAt) {
-          // First event arrived — stop watching; response still settles the turn.
-          window.clearInterval(timer);
-          return;
+        if (concurrentGen !== null && this.concurrentGenOf(sessionId) !== concurrentGen) {
+          return false;
         }
-        if (Date.now() - writtenAt < FIRST_EVENT_STALL_MS) return;
+        return true;
+      };
+      const expire = (reason: Exclude<PromptTurnExpireReason, "ok">) => {
         finish(() => {
-          void this.notify(ACP_METHODS.sessionCancel, {
-            sessionId,
-            _meta: { trigger: "first_event_watchdog", cancelSubagents: true },
-          }).catch(() => {});
-          // Drop bookkeeping so finishTurn can paint idle (invalidate bumps gen).
-          this.invalidatePromptFlights(sessionId);
-          this.finishTurn(sessionId);
-          reject(
-            new Error(
-              `Agent 超过 ${Math.round(FIRST_EVENT_STALL_MS / 1000)}s 无事件返回（常见于上一轮工具未结束）。已自动终止，草稿可重试。`,
-            ),
-          );
+          const message = promptTurnTimeoutMessage(reason);
+          const err = new Error(message);
+          // Primary expire (or concurrent when no primary): cancel agent + clear tools.
+          // Concurrent-only expire must NOT invalidate primary flights or session/cancel
+          // a still-live primary turn.
+          const primaryLive = this.primaryPromptSessions.has(sessionId);
+          const killSession = primaryGen !== null || !primaryLive;
+          if (killSession) {
+            void this.notify(ACP_METHODS.sessionCancel, {
+              sessionId,
+              _meta: {
+                trigger: `prompt_turn_${reason}`,
+                cancelSubagents: true,
+              },
+            }).catch(() => {});
+            // Parity with user Stop: close gates so Allow is not clickable after idle.
+            this.resolveOpenInteractions(sessionId);
+            this.stickyStopComputerIfNeeded(sessionId);
+            this.abortOpenTools(sessionId, `回合超时（${reason}）`);
+            // Hard-settle the RPC so late agent replies do not resurrect the flight.
+            this.rejectPendingForSession(sessionId, err);
+            // R2 P0: emit hard error BEFORE invalidatePromptFlights.
+            // invalidate bumps primaryPromptGen, so promptInner catch would
+            // treat the reject as superseded and return without painting —
+            // silent 就绪 + green check, no queueNotice / turnErrors.
+            this.emit({ type: "error", sessionId, message });
+            // Drop bookkeeping so late finally cannot settle a newer turn.
+            this.invalidatePromptFlights(sessionId);
+            this.finishTurn(sessionId);
+          }
+          reject(err);
         });
-      }, 500);
+      };
+      const timer = window.setInterval(() => {
+        if (!stillCurrent()) {
+          // Always settle the wrapper so await/finally cannot hang forever.
+          finish(() => reject(new Error("回合已取消")));
+          return;
+        }
+        const reason = shouldExpirePromptTurn({
+          now: Date.now(),
+          writtenAt,
+          lastActivityAt: this.liveTurnActivityAt.get(sessionId) ?? 0,
+          hasOpenTools: this.hasOpenTools(sessionId),
+          hasOpenGate: this.hasOpenInteraction(sessionId),
+          firstEventMs: FIRST_EVENT_STALL_MS,
+        });
+        if (reason !== "ok") expire(reason);
+      }, PROMPT_TURN_POLL_MS);
       response.then(
-        (value) => finish(() => resolve(value)),
-        (error) => finish(() => reject(error)),
+        (value) => {
+          if (!stillCurrent()) {
+            finish(() => reject(new Error("回合已取消")));
+            return;
+          }
+          finish(() => resolve(value));
+        },
+        (error) => {
+          if (!stillCurrent()) {
+            finish(() => reject(new Error("回合已取消")));
+            return;
+          }
+          finish(() => reject(error instanceof Error ? error : new Error(String(error))));
+        },
       );
     });
   }
@@ -2733,6 +2984,16 @@ export class AcpBridge implements GrokBridge {
       });
       return;
     }
+    // Late permission after cancel/timeout — auto-deny, no clickable card (R2).
+    if (!this.isTurnFlightLive(sessionId) && !this.replaying.has(sessionId)) {
+      void this.sendRaw({
+        jsonrpc: "2.0",
+        id: rpcId,
+        result: { outcome: { outcome: "cancelled" } },
+      });
+      return;
+    }
+    this.noteLiveTurnActivity(sessionId);
     const toolCallId = string(tool.toolCallId) ?? string(params.toolCallId) ?? uid();
     // Include rpcId so two concurrent tools with the same toolCallId do not share a card.
     const blockId = `permission-${toolCallId}-${String(rpcId)}`;
@@ -2861,6 +3122,11 @@ export class AcpBridge implements GrokBridge {
       void this.sendRaw({ jsonrpc: "2.0", id: rpcId, result: { outcome: "abandoned" } });
       return;
     }
+    if (!this.isTurnFlightLive(sessionId) && !this.replaying.has(sessionId)) {
+      void this.sendRaw({ jsonrpc: "2.0", id: rpcId, result: { outcome: "abandoned" } });
+      return;
+    }
+    this.noteLiveTurnActivity(sessionId);
     const toolCallId = string(params.toolCallId) ?? uid();
     const blockId = `plan-approval-${toolCallId}-${String(rpcId)}`;
     this.interactions.set(blockId, {
@@ -2889,6 +3155,15 @@ export class AcpBridge implements GrokBridge {
   private handleQuestion(rpcId: RpcId, paramsValue: unknown) {
     const params = record(paramsValue) ?? {};
     const sessionId = string(params.sessionId);
+    if (!sessionId) {
+      void this.sendRaw({ jsonrpc: "2.0", id: rpcId, result: { outcome: "cancelled" } });
+      return;
+    }
+    if (!this.isTurnFlightLive(sessionId) && !this.replaying.has(sessionId)) {
+      void this.sendRaw({ jsonrpc: "2.0", id: rpcId, result: { outcome: "cancelled" } });
+      return;
+    }
+    this.noteLiveTurnActivity(sessionId);
     const toolCallId = string(params.toolCallId) ?? uid();
     // Unique per RPC so stacked ask_user interviews never share one card/map slot.
     const blockId = `question-${toolCallId}-${String(rpcId)}`;
@@ -3699,10 +3974,13 @@ export class AcpBridge implements GrokBridge {
         }
         const concurrentGen = this.noteConcurrentStart(sessionId);
         try {
+          // Same sliding policy as primary — no fixed 30m RPC timer.
+          const writtenAt = Date.now();
           const { response, written } = this.beginRequest(
             ACP_METHODS.sessionPrompt,
             params,
-            1_800_000,
+            0,
+            sessionId,
           );
           await written;
           // Cancelled mid-write: do not re-raise running; fail the store await so
@@ -3715,7 +3993,21 @@ export class AcpBridge implements GrokBridge {
           if (!this.hasOpenInteraction(sessionId)) {
             this.emit({ type: "status", sessionId, status: "running" });
           }
-          void response
+          // Seed only when primary already produced live updates — never invent
+          // first-event activity for a zero-event primary (would skip 25s stall).
+          const priorActivity = this.liveTurnActivityAt.get(sessionId) ?? 0;
+          if (priorActivity > 0 && priorActivity < writtenAt) {
+            this.liveTurnActivityAt.set(sessionId, writtenAt);
+          } else if (!this.primaryPromptSessions.has(sessionId) && priorActivity < writtenAt) {
+            // Concurrent-only flight (no primary): seed so we do not first-event-stall.
+            this.liveTurnActivityAt.set(sessionId, writtenAt);
+          }
+          void this.withPromptTurnWatchdog(sessionId, {
+            primaryGen: null,
+            concurrentGen,
+            writtenAt,
+            response,
+          })
             .catch((error) => {
               // Soft only: BridgeEvent "error" forces store status→idle and would
               // yank a still-running primary turn (queue fail mid-turn).
@@ -3903,14 +4195,20 @@ export class AcpBridge implements GrokBridge {
         if (this.primaryPromptGen.get(sessionId) !== primaryGen) {
           return;
         }
-        // Finite timeout: timeout 0 left "0 条事件" forever until operator Stop.
+        // Drop FE leftover open tools from a prior abandoned turn so idle
+        // suppress and UI 执行中 cannot stick across primary writes.
+        this.abortOpenTools(sessionId, "新回合开始");
+        // No fixed wall-clock RPC timer: a hard 15m killed healthy multi-tool
+        // turns (cargo test + edits) at 900s. Watchdog uses activity + open tools
+        // + absolute ceiling (see promptTurnTimeout).
         const started = this.beginRequest(
           ACP_METHODS.sessionPrompt,
           {
             sessionId,
             prompt: promptContent(text, options.attachments ?? []),
           },
-          15 * 60_000,
+          0,
+          sessionId,
         );
         await started.written;
         if (this.primaryPromptGen.get(sessionId) !== primaryGen) {
@@ -3920,12 +4218,12 @@ export class AcpBridge implements GrokBridge {
         // Only count activity after the wire write (pre_prompt_clear noise ignored).
         const writtenAt = Date.now();
         this.liveTurnActivityAt.set(sessionId, 0);
-        responsePromise = this.withFirstEventWatchdog(
-          sessionId,
+        responsePromise = this.withPromptTurnWatchdog(sessionId, {
           primaryGen,
+          concurrentGen: null,
           writtenAt,
-          started.response,
-        );
+          response: started.response,
+        });
       });
 
       // Wait for turn completion without holding the exclusive channel.
@@ -3940,7 +4238,13 @@ export class AcpBridge implements GrokBridge {
       // Healthy turn: allow another auto-fallback if the gate regresses later.
       this.productGateFallbackDone = false;
     } catch (error) {
+      // Superseded by cancel / newer primary — do not hard-error over a live turn.
+      if (this.primaryPromptGen.get(sessionId) !== primaryGen) return;
       const detail = errorText(error);
+      // Soft cancel after supersede (watchdog settle) — no error paint.
+      if (/回合已取消|队列提交已取消|已取消/i.test(detail) && !/超时|自动终止/.test(detail)) {
+        return;
+      }
       // CU refuse is handled by the store (restore draft); avoid dual error paint.
       if (
         detail === COMPUTER_USE_OPT_IN_REFUSE_MESSAGE
@@ -4023,41 +4327,23 @@ export class AcpBridge implements GrokBridge {
   }
 
   cancel(sessionId: string): void {
-    for (const [blockId, interaction] of this.interactions) {
-      if (interaction.sessionId !== sessionId) continue;
-      this.interactions.delete(blockId);
-      // Resolve UI cards so Question/Permission do not stay "answerable" after Stop
-      // (wire abandon alone does not emit permission_resolved / question_resolved).
-      if (interaction.kind === "permission" || interaction.kind === "plan") {
-        this.emit({
-          type: "permission_resolved",
-          sessionId,
-          blockId,
-          option: "deny",
-        });
-      } else if (interaction.kind === "question") {
-        this.emit({
-          type: "question_resolved",
-          sessionId,
-          blockId,
-          response: { outcome: "cancelled" },
-        });
-      }
-      const result =
-        interaction.kind === "permission"
-          ? { outcome: { outcome: "cancelled" } }
-          : { outcome: "cancelled" };
-      void this.sendRaw({ jsonrpc: "2.0", id: interaction.rpcId, result });
-    }
+    // Resolve UI cards so Question/Permission do not stay "answerable" after Stop.
+    this.resolveOpenInteractions(sessionId);
     // Unblock live stream if we cancelled mid silent-bind / CU attach.
     void this.clearSilentForLiveTurn(sessionId);
+    // Sticky-stop Computer Use so Stop is a real desktop kill (R2).
+    this.stickyStopComputerIfNeeded(sessionId);
+    // Hard-settle session/prompt so await/catch cannot late-error a new turn.
+    this.rejectPendingForSession(sessionId, new Error("回合已取消"));
     // Invalidate primary + concurrent gens so late finally handlers are no-ops.
     this.invalidatePromptFlights(sessionId);
+    this.abortOpenTools(sessionId, "用户停止");
     void this.notify(ACP_METHODS.sessionCancel, {
       sessionId,
       _meta: { trigger: "user", cancelSubagents: true },
     }).catch((error) => {
-      this.emit({ type: "error", sessionId, message: errorText(error) });
+      // Soft: late cancel notify must not force idle over a newer primary (R2).
+      this.emitSoftError(sessionId, `停止信号发送失败：${errorText(error)}`);
     });
     // Force UI settle (finishTurn is unblocked now that counts are cleared).
     this.finishTurn(sessionId);
