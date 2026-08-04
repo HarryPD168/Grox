@@ -53,6 +53,10 @@ import type {
 import { DEMO_CWD } from "../demo/data";
 import { mergeOfflineWithLive } from "../lib/offlineMerge";
 import {
+  consumeShellUpgradeRescan,
+  shouldForceOfflineRescan,
+} from "../lib/sessionOpenPolicy";
+import {
   filterBusyTurnQueueEntries,
   filterConsumedQueueEntries,
   filterQueueGhostsByLiveTexts,
@@ -74,6 +78,12 @@ import {
 const offlineHistoryComplete = new Set<string>();
 /** Missions with an in-flight offline scan (avoid re-invoke restart storms). */
 const offlineHistoryScanning = new Set<string>();
+/**
+ * After a desktop shell upgrade: force full offline rescan even when fingerprint
+ * UI transcript is still "fresh" (mtime match). Cleared after the first successful
+ * complete scan this process, or when the process exits.
+ */
+let upgradeForceOfflineRescan = false;
 /**
  * Sessions deleted this process lifetime — late disk-history events must not
  * resurrect them into `sessions` (R3 tombstone).
@@ -2348,14 +2358,19 @@ export const useDesktop = create<DesktopState>((set, get) => {
                     sessions: { ...get().sessions, [payload.id]: merged },
                   });
                   if (merged.blocks.length > 0) scheduleSaveSessionCache(merged);
-                  if (phaseComplete) offlineHistoryComplete.add(payload.id);
+                  if (phaseComplete) {
+                    offlineHistoryComplete.add(payload.id);
+                    if (upgradeForceOfflineRescan) upgradeForceOfflineRescan = false;
+                  }
                 }, 0);
               }
             } else if (phaseComplete && !liveBusy) {
               offlineHistoryComplete.add(payload.id);
+              if (upgradeForceOfflineRescan) upgradeForceOfflineRescan = false;
             }
           } else if (phaseComplete && !liveBusy) {
             offlineHistoryComplete.add(payload.id);
+            if (upgradeForceOfflineRescan) upgradeForceOfflineRescan = false;
           }
 
           if (get().fullHistoryLoadingId === payload.id && get().historyLoadMode === "disk") {
@@ -2425,8 +2440,22 @@ export const useDesktop = create<DesktopState>((set, get) => {
         }, 750);
         if (!auth.required) void get().refreshAccount();
         void get().refreshProviderProfiles();
-        // Background update check against GitHub Releases (non-blocking).
+        // Pin shell version from native package (no network) so post-upgrade
+        // openSession can force offline rescan before the delayed update check.
         if (bridge.kind === "acp") {
+          try {
+            const env = await invoke<{ appVersion?: string }>("desktop_environment");
+            const ver = (env.appVersion ?? "").trim();
+            if (ver) {
+              set({ appVersion: ver });
+              if (consumeShellUpgradeRescan(ver)) {
+                upgradeForceOfflineRescan = true;
+                offlineHistoryComplete.clear();
+              }
+            }
+          } catch {
+            /* non-fatal */
+          }
           window.setTimeout(() => {
             void get().checkAppUpdate();
           }, 2_500);
@@ -2505,9 +2534,14 @@ export const useDesktop = create<DesktopState>((set, get) => {
       set({ appUpdateChecking: true, appUpdateError: null });
       try {
         const info = await invoke<AppUpdateInfo>("check_app_update");
+        const ver = info.currentVersion || get().appVersion;
+        if (ver && consumeShellUpgradeRescan(ver)) {
+          upgradeForceOfflineRescan = true;
+          offlineHistoryComplete.clear();
+        }
         set({
           appUpdate: info,
-          appVersion: info.currentVersion || get().appVersion,
+          appVersion: ver,
           appUpdateChecking: false,
           appUpdateError: null,
         });
@@ -2837,14 +2871,33 @@ export const useDesktop = create<DesktopState>((set, get) => {
           }
         };
 
+        // Post-upgrade: drop stale FE bind so the next send rehydrates cleanly.
+        if (
+          shouldForceOfflineRescan({
+            upgradeRescanActive: upgradeForceOfflineRescan,
+            alreadyComplete: offlineHistoryComplete.has(id),
+          })
+        ) {
+          bridge.resetSessionBind?.(id);
+          offlineHistoryComplete.delete(id);
+        }
+
         // 1) Memory hit (may already be full if offline scan or send finished earlier)
         if (has) {
-          applyChrome(has, { loadingDisk: !offlineHistoryComplete.has(id) });
+          const needRescan =
+            !offlineHistoryComplete.has(id) ||
+            shouldForceOfflineRescan({
+              upgradeRescanActive: upgradeForceOfflineRescan,
+              alreadyComplete: offlineHistoryComplete.has(id),
+            });
+          if (needRescan) offlineHistoryComplete.delete(id);
+          applyChrome(has, { loadingDisk: needRescan });
           kickOfflineHistory(has);
           return;
         }
 
         // 2) Durable offline transcript (fingerprint-matched) — skip 100MB+ rescan
+        //    UNLESS post-upgrade force-rescan (fingerprint can match a truncated paint).
         if (bridge.kind === "acp") {
           try {
             const raw = await invoke<string | null>("get_ui_transcript", { id });
@@ -2852,6 +2905,17 @@ export const useDesktop = create<DesktopState>((set, get) => {
             if (raw) {
               const transcript = normalizeOfflineSession(JSON.parse(raw) as Session);
               if (transcript && transcript.id === id && transcript.blocks.length > 0) {
+                const forceRescan = shouldForceOfflineRescan({
+                  upgradeRescanActive: upgradeForceOfflineRescan,
+                  alreadyComplete: false,
+                });
+                if (forceRescan) {
+                  // Paint fast snapshot, but keep scanning so chrome is honest.
+                  applyChrome(transcript, { loadingDisk: true });
+                  scheduleSaveSessionCache(transcript);
+                  kickOfflineHistory(transcript);
+                  return;
+                }
                 offlineHistoryComplete.add(id);
                 applyChrome(transcript, { loadingDisk: false });
                 scheduleSaveSessionCache(transcript);
@@ -3905,6 +3969,8 @@ export const useDesktop = create<DesktopState>((set, get) => {
           if (offlineHistoryDeleted.has(session.id) || !s.sessions[session.id]) {
             return;
           }
+          // Half-bind recovery: drop FE "bound" so the next send retries silent load.
+          bridge.resetSessionBind?.(session.id);
           const clearAgent =
             s.fullHistoryLoadingId === session.id && s.historyLoadMode === "agent";
           const curSession = get().sessions[session.id];

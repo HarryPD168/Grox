@@ -123,6 +123,8 @@ interface JsonRpcMessage extends JsonObject {
 interface DesktopEnvironment {
   defaultWorkspace: string;
   grokCommand: string;
+  /** Package version (CARGO_PKG_VERSION) — used for post-upgrade rescan. */
+  appVersion?: string;
 }
 
 interface ExitPayload {
@@ -1081,6 +1083,22 @@ export class AcpBridge implements GrokBridge {
 
   isSessionBound(id: string): boolean {
     return this.knownSessions.has(id);
+  }
+
+  /**
+   * Clear bind/silent/load bookkeeping so the next primary send rehydrates.
+   * Used after shell upgrades and failed silent binds (half-open sessions).
+   */
+  resetSessionBind(id: string): void {
+    this.knownSessions.delete(id);
+    this.silentReplaying.delete(id);
+    this.replaying.delete(id);
+    this.loadPromises.delete(id);
+    this.liveTurnActivityAt.delete(id);
+    this.openToolCallIds.delete(id);
+    this.terminalToolCallIds.delete(id);
+    this.primaryPromptSessions.delete(id);
+    void this.setSilentStream(false, id).catch(() => {});
   }
 
   setActiveSessionGetter(getter: () => string | null): void {

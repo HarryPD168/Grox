@@ -106,6 +106,11 @@ export interface GrokBridge {
 
   /** True once ACP session/load (or new) has bound this id in the agent process. */
   isSessionBound?(id: string): boolean;
+  /**
+   * Drop FE bind bookkeeping for a session so the next send re-runs silent
+   * session/load (post-upgrade open / half-bind recovery).
+   */
+  resetSessionBind?(id: string): void;
 
   /**
    * Visit memory + priority queue:
