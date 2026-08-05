@@ -583,16 +583,22 @@ export function Timeline({ session }: { session: Session }) {
       Date.now() + suppressMs,
     );
     el.scrollTop = el.scrollHeight;
+    // Re-apply after late layout (folds/markdown). Cap at 320ms — do NOT clear
+    // pinningRef here when suppressMs is longer (open uses 2000ms); otherwise
+    // the early timeout never clears pin and unfollow stays dead (review P1).
     window.setTimeout(() => {
-      // Re-apply after late layout (folds/markdown) then release pin flag.
       const node = scrollerRef.current;
       if (node && followRef.current) {
         node.scrollTop = node.scrollHeight;
       }
+    }, Math.min(suppressMs, 320));
+    // Always release pin when this suppress window ends (unless a later pin
+    // extended suppressUnfollowUntilRef past this deadline).
+    window.setTimeout(() => {
       if (Date.now() >= suppressUnfollowUntilRef.current - 50) {
         pinningRef.current = false;
       }
-    }, Math.min(suppressMs, 320));
+    }, suppressMs);
     return true;
   }, []);
 

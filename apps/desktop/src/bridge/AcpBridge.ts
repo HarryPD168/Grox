@@ -4811,8 +4811,16 @@ export class AcpBridge implements GrokBridge {
       return;
     }
     const metaRequest = await this.sessionMeta(meta.cwd, sessionId);
-    this.silentReplaying.add(sessionId);
-    await this.setSilentStream(true, sessionId);
+    // Mid-turn CU attach must NOT silent-filter session/update — that black-holes
+    // the live primary stream for up to 2 minutes (review P0). Idle attach keeps
+    // silent to avoid history flood over offline paint.
+    const liveTurn =
+      this.primaryPromptSessions.has(sessionId) ||
+      (this.concurrentPromptCount.get(sessionId) ?? 0) > 0;
+    if (!liveTurn) {
+      this.silentReplaying.add(sessionId);
+      await this.setSilentStream(true, sessionId);
+    }
     try {
       try {
         await this.request(
@@ -4854,8 +4862,10 @@ export class AcpBridge implements GrokBridge {
         status: "running",
       });
     } finally {
-      this.silentReplaying.delete(sessionId);
-      await this.setSilentStream(false, sessionId);
+      if (!liveTurn) {
+        this.silentReplaying.delete(sessionId);
+        await this.setSilentStream(false, sessionId);
+      }
     }
   }
 

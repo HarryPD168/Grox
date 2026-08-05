@@ -38,8 +38,20 @@ export function firstPrimaryUserBlock(
   return blocks.find((b) => b.type === "user" && !b.interjected);
 }
 
+/** Synthetic tool ids from chat_history preview / offline prefixes — not ACP call ids. */
+export function isSyntheticToolCallId(id: string | undefined): boolean {
+  if (!id) return true;
+  return (
+    id === "tool" ||
+    id.startsWith("disk-tool-") ||
+    id.startsWith("off-tool-") ||
+    id.startsWith("off-tool-cal")
+  );
+}
+
 /**
  * Reuse live block objects when content keys match offline (stable React keys).
+ * Prefer fuller offline body when live is cache-truncated (same content key).
  */
 export function stabilizeOfflineBlocksWithLive(
   offlineBlocks: readonly SessionBlock[],
@@ -51,7 +63,22 @@ export function stabilizeOfflineBlocksWithLive(
     const k = blockContentKey(b);
     if (!liveByKey.has(k)) liveByKey.set(k, b);
   }
-  return offlineBlocks.map((b) => liveByKey.get(blockContentKey(b)) ?? b);
+  return offlineBlocks.map((b) => {
+    const live = liveByKey.get(blockContentKey(b));
+    if (!live) return b;
+    // Cache paint truncates text; offline scan has the fuller body — keep live
+    // identity (React key) but restore offline text when longer.
+    if (
+      (b.type === "assistant" || b.type === "user" || b.type === "thinking") &&
+      live.type === b.type &&
+      typeof b.text === "string" &&
+      typeof live.text === "string" &&
+      b.text.length > live.text.length
+    ) {
+      return { ...live, text: b.text } as SessionBlock;
+    }
+    return live;
+  });
 }
 
 /**
@@ -90,6 +117,11 @@ export function insertLiveOnlyIntoOffline(
   // shift after earlier inserts at that index.
   for (let li = 0; li < liveBlocks.length; li += 1) {
     const block = liveBlocks[li];
+    // chat_history preview tools use disk-tool-* ids / kind "other"; updates scan
+    // uses real ACP call ids. Treating them as live-only duplicates every tool card.
+    if (block.type === "tool" && isSyntheticToolCallId(block.call?.id)) {
+      continue;
+    }
     const key = blockContentKey(block);
     if (offlineKeys.has(key)) continue;
     // Already inserted (duplicate live-only)?

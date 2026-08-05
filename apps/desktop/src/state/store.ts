@@ -353,8 +353,19 @@ function startOfflineScanPoll(sessionId: string): void {
         }
         // Strict id match only — empty active id after cancel is not "ours".
         const progressOwned = Boolean(p.id) && p.id === sessionId;
+        // Do NOT mark complete while the live session is still busy — event path
+        // defers merge via pendingOfflineMerge; premature complete blocks re-open
+        // rescan (review F3).
+        const live = useDesktop.getState().sessions[sessionId];
+        const liveBusyNow =
+          live &&
+          (live.status === "running" ||
+            live.status === "awaiting_permission" ||
+            live.status === "awaiting_input" ||
+            promptInFlightSessions.has(sessionId));
         if (
           progressOwned &&
+          !liveBusyNow &&
           (phase === "complete" || phase === "no-updates" || phase === "missing")
         ) {
           offlineHistoryComplete.add(sessionId);
@@ -2403,17 +2414,17 @@ export const useDesktop = create<DesktopState>((set, get) => {
                   }
                   if (phaseComplete) {
                     offlineHistoryComplete.add(payload.id);
-                    if (upgradeForceOfflineRescan) upgradeForceOfflineRescan = false;
+                    // Keep upgradeForceOfflineRescan for the whole process so
+                    // every mission opened after shell upgrade gets a real scan
+                    // (cleared only on next version pin via consumeShellUpgradeRescan).
                   }
                 }, 0);
               }
             } else if (phaseComplete && !liveBusy) {
               offlineHistoryComplete.add(payload.id);
-              if (upgradeForceOfflineRescan) upgradeForceOfflineRescan = false;
             }
           } else if (phaseComplete && !liveBusy) {
             offlineHistoryComplete.add(payload.id);
-            if (upgradeForceOfflineRescan) upgradeForceOfflineRescan = false;
           }
 
           if (get().fullHistoryLoadingId === payload.id && get().historyLoadMode === "disk") {
@@ -2850,7 +2861,11 @@ export const useDesktop = create<DesktopState>((set, get) => {
           if (!stillThisOpen()) return;
           if (bridge.kind !== "acp") return;
           if (offlineHistoryDeleted.has(id)) return;
-          if (offlineHistoryComplete.has(id)) return;
+          // Upgrade generation must re-scan even if a prior fingerprint "complete"
+          // was recorded earlier in this process (Wave-1 would otherwise no-op).
+          const forceScan = upgradeForceOfflineRescan;
+          if (offlineHistoryComplete.has(id) && !forceScan) return;
+          if (forceScan) offlineHistoryComplete.delete(id);
           // Already scanning this id — join poll, do not re-invoke.
           if (offlineHistoryScanning.has(id)) {
             set({ fullHistoryLoadingId: id, historyLoadMode: "disk" });
@@ -2876,6 +2891,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
             title: session?.title ?? meta?.title ?? null,
             cwd: session?.cwd ?? meta?.cwd ?? null,
             model: session?.model ?? meta?.model ?? null,
+            force: forceScan,
           }).catch((error) => {
             console.warn("start_offline_session_history failed", error);
             offlineHistoryScanning.delete(id);
@@ -2894,12 +2910,15 @@ export const useDesktop = create<DesktopState>((set, get) => {
               ? ensureProject(get().projects, meta.cwd, { force: true })
               : get().projects;
           let painted = session ?? null;
-          // Do not force idle while a send/bind is in flight (double-prompt race).
+          // Unbound open paint must not resume dead gates / busy chrome from
+          // memory or cache (sanitizeSessionForOpen intent; review F4).
           if (
             painted &&
             !bridge.isSessionBound?.(painted.id) &&
-            painted.status === "running" &&
-            !promptInFlightSessions.has(painted.id)
+            !promptInFlightSessions.has(painted.id) &&
+            (painted.status === "running" ||
+              painted.status === "awaiting_permission" ||
+              painted.status === "awaiting_input")
           ) {
             painted = { ...painted, status: "idle" };
           }
@@ -3942,8 +3961,33 @@ export const useDesktop = create<DesktopState>((set, get) => {
       mirrorQueueDrainParked(set, get, session.id, false);
       clearConsumedConcurrent(session.id);
 
+      // Mid-bind double-send: status stays idle until bound, so a second Enter
+      // used to release the first flight and start a second primary (dual user
+      // bubbles / supersede). Park the second message in the local queue instead.
+      const needsBindEarly = !bridge.isSessionBound?.(session.id);
+      if (promptInFlightSessions.has(session.id) && needsBindEarly) {
+        const q = get().promptQueues[session.id] ?? [];
+        const entry: QueuedPrompt = {
+          id: uid(),
+          text: trimmed,
+          attachments: [...attachments],
+          createdAt: Date.now(),
+          state: "queued",
+          source: "local",
+        };
+        const nextComposers = {
+          ...sessionComposers,
+          [session.id]: { ...composer, text: "", attachments: [] },
+        };
+        persistSessionComposers(nextComposers);
+        set({
+          promptQueues: { ...get().promptQueues, [session.id]: [...q, entry] },
+          sessionComposers: nextComposers,
+        });
+        return false;
+      }
       // Claim the in-flight slot before any await/set so double-click cannot dual-paint.
-      // If a prior flight was left after status→idle, release it so Ready can send.
+      // If a prior flight was left after status→idle (bound path), release it so Ready can send.
       if (promptInFlightSessions.has(session.id)) {
         releasePromptFlight(session.id);
       }
@@ -3957,7 +4001,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
       persistSessionComposers(nextComposers);
       // Paint the user bubble immediately, but keep status as-is until bind/prompt
       // actually starts streaming — avoids a long fake "0 条事件" during silent bind.
-      const needsBind = !bridge.isSessionBound?.(session.id);
+      const needsBind = needsBindEarly;
       set({
         sessions: {
           ...sessions,

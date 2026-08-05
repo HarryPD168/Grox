@@ -3,6 +3,7 @@ import {
   blockContentKey,
   firstPrimaryUserBlock,
   insertLiveOnlyIntoOffline,
+  isSyntheticToolCallId,
   mergeOfflineWithLive,
 } from "./offlineMerge";
 import type { Session } from "../bridge/types";
@@ -219,5 +220,43 @@ describe("mergeOfflineWithLive (0.2.24 evidence-driven)", () => {
       "你现在尝试",
       "# Push 成功",
     ]);
+  });
+
+  it("skips synthetic disk-tool live-only so preview tools do not duplicate", () => {
+    const offline: Session["blocks"] = [
+      { type: "user", id: "u", text: "go", ts: 1 },
+      {
+        type: "tool",
+        id: "off-t",
+        ts: 2,
+        call: {
+          id: "call-real",
+          kind: "execute",
+          title: "run",
+          status: "done",
+          startedAt: 2,
+        },
+      },
+    ];
+    const live: Session["blocks"] = [
+      { type: "user", id: "live-u", text: "go", ts: 1 },
+      {
+        type: "tool",
+        id: "disk-t",
+        ts: 2,
+        call: {
+          id: "disk-tool-5-0",
+          kind: "other",
+          title: "run_terminal_command",
+          status: "done",
+          startedAt: 2,
+        },
+      },
+    ];
+    const out = insertLiveOnlyIntoOffline(offline, live);
+    expect(out.filter((b) => b.type === "tool")).toHaveLength(1);
+    expect(out.find((b) => b.type === "tool")?.call.id).toBe("call-real");
+    expect(isSyntheticToolCallId("disk-tool-1-0")).toBe(true);
+    expect(isSyntheticToolCallId("call-real")).toBe(false);
   });
 });

@@ -5218,8 +5218,15 @@ fn write_ui_transcript(
     session_id: &str,
     session: &serde_json::Value,
     updates_path: &Path,
+    scanned_bytes: u64,
 ) -> Result<(), String> {
     let (size, mtime_ms) = file_size_mtime_ms(updates_path).unwrap_or((0, 0));
+    // Grow-during-scan TOCTOU: file grew after we streamed EOF → fingerprint
+    // would claim complete against a larger size while blocks are incomplete.
+    // Refuse durable cache so the next open re-scans (evidence: review P1-2).
+    if size > scanned_bytes.saturating_add(64) {
+        return Ok(());
+    }
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -5231,6 +5238,7 @@ fn write_ui_transcript(
         "source": {
             "updatesSize": size,
             "updatesMtimeMs": mtime_ms,
+            "scannedBytes": scanned_bytes,
         },
         "scan": {
             "complete": true,
@@ -5276,6 +5284,13 @@ fn read_ui_transcript_if_fresh(session_dir: &Path, session_id: &str) -> Option<s
     // while transcript still held a complete scan).
     if src_size != size {
         return None;
+    }
+    // Prefer envelopes that recorded scannedBytes == size (post-0.2.25).
+    // Older envelopes omit the field — still accepted when size matches.
+    if let Some(scanned) = src.get("scannedBytes").and_then(|v| v.as_u64()) {
+        if scanned != src_size {
+            return None;
+        }
     }
     // Allow small mtime drift when size is identical (filesystem touch / lock).
     let mtime_skew = mtime_ms.abs_diff(src_mtime);
@@ -5789,6 +5804,10 @@ fn pack_offline_session(
 
 /// Stream-parse `updates.jsonl` on a worker thread (no Agent, no UI freeze).
 /// Switching sessions bumps the generation and abandons the previous scan.
+///
+/// `force`: when true, skip the Wave-1 fingerprint short-circuit so upgrade
+/// open paths re-run enrich (chat_history users) instead of serving a stale
+/// pre-upgrade `grox-ui-transcript.v1.json`.
 #[tauri::command]
 fn start_offline_session_history(
     app: tauri::AppHandle,
@@ -5796,7 +5815,9 @@ fn start_offline_session_history(
     title: Option<String>,
     cwd: Option<String>,
     model: Option<String>,
+    force: Option<bool>,
 ) -> Result<(), String> {
+    let force = force.unwrap_or(false);
     let safe: String = id
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
@@ -5899,43 +5920,47 @@ fn start_offline_session_history(
             }
 
             // Wave 1: durable fingerprint cache — skip multi-hundred-MB rescan.
-            if let Some(cached) = read_ui_transcript_if_fresh(&dir, &safe) {
-                if !abandoned() {
-                    let blocks_n = cached
-                        .get("blocks")
-                        .and_then(|v| v.as_array())
-                        .map(|a| a.len())
-                        .unwrap_or(0);
-                    scan_progress_set(0, 0, blocks_n as u64);
-                    scan_progress_finish_if(gen, "complete");
-                    let payload = serde_json::json!({
-                        "id": safe,
-                        "gen": gen,
-                        "done": true,
-                        "phase": "complete",
-                        "session": cached,
-                        "fromCache": true,
-                        "percent": 100,
-                        "bytesRead": 0,
-                        "totalBytes": 0,
-                        "lines": 0,
-                        "blocks": blocks_n,
-                    });
-                    let _ = app.emit("disk-history-progress", payload);
-                } else {
-                    // Still notify FE so offlineHistoryScanning can drop this id.
-                    let _ = app.emit(
-                        "disk-history-progress",
-                        serde_json::json!({
+            // Upgrade force-rescan MUST bypass this path (FE force flag); otherwise
+            // post-upgrade open paints a pre-enrich transcript and marks complete.
+            if !force {
+                if let Some(cached) = read_ui_transcript_if_fresh(&dir, &safe) {
+                    if !abandoned() {
+                        let blocks_n = cached
+                            .get("blocks")
+                            .and_then(|v| v.as_array())
+                            .map(|a| a.len())
+                            .unwrap_or(0);
+                        scan_progress_set(0, 0, blocks_n as u64);
+                        scan_progress_finish_if(gen, "complete");
+                        let payload = serde_json::json!({
                             "id": safe,
                             "gen": gen,
                             "done": true,
-                            "phase": "cancelled",
-                        }),
-                    );
+                            "phase": "complete",
+                            "session": cached,
+                            "fromCache": true,
+                            "percent": 100,
+                            "bytesRead": 0,
+                            "totalBytes": 0,
+                            "lines": 0,
+                            "blocks": blocks_n,
+                        });
+                        let _ = app.emit("disk-history-progress", payload);
+                    } else {
+                        // Still notify FE so offlineHistoryScanning can drop this id.
+                        let _ = app.emit(
+                            "disk-history-progress",
+                            serde_json::json!({
+                                "id": safe,
+                                "gen": gen,
+                                "done": true,
+                                "phase": "cancelled",
+                            }),
+                        );
+                    }
+                    clear_active();
+                    return;
                 }
-                clear_active();
-                return;
             }
 
             let (mut title_s, mut cwd_s, mut model_s, mut created_at, mut updated_at) =
@@ -6505,7 +6530,8 @@ fn start_offline_session_history(
                 &safe, &title_s, &cwd_s, &model_s, created_at, updated_at, &blocks,
             );
             // Durable fingerprint cache for next cold open (even if later cancelled).
-            let _ = write_ui_transcript(&dir, &safe, &packed, &updates_path);
+            // Pass bytes actually streamed so grow-during-scan cannot pin incomplete complete.
+            let _ = write_ui_transcript(&dir, &safe, &packed, &updates_path, bytes_read);
             if abandoned() {
                 exit_cancelled();
                 return;
@@ -6521,10 +6547,11 @@ fn start_offline_session_history(
                 if OFFLINE_HISTORY_GEN.load(Ordering::SeqCst) == gen {
                     SCAN_DONE.store(1, Ordering::Relaxed);
                     SCAN_PHASE_CODE.store(phase_code("error"), Ordering::Relaxed);
-                }
-                if let Ok(mut guard) = OFFLINE_HISTORY_ACTIVE_ID.lock() {
-                    if guard.as_str() == safe {
-                        guard.clear();
+                    // Gen-scoped ACTIVE_ID clear (match clear_active) — do not clobber N+1.
+                    if let Ok(mut guard) = OFFLINE_HISTORY_ACTIVE_ID.lock() {
+                        if guard.as_str() == safe {
+                            guard.clear();
+                        }
                     }
                 }
                 let _ = app.emit(
@@ -6790,12 +6817,11 @@ fn enrich_users_from_chat_history(
         return;
     }
 
-    // Insert from back to front so earlier indices stay valid for later inserts
-    // that target later "next_present" positions. Group by insert index.
-    // Build final list: walk chat order, emit missing then present offline turns.
-    // Simpler approach: for each missing, find insert index and insert; process
-    // in reverse chat order so indices of later anchors remain stable.
-    for (text, next_present) in missing.into_iter().rev() {
+    // Front-to-back (chat order): when several missings share the same next_present
+    // anchor, reverse insert inverted them to [B,A,C] instead of [A,B,C] (review P1-1).
+    // Inserting earlier missings first shifts the anchor index so later inserts
+    // at the same anchor land after prior missings — correct relative order.
+    for (text, next_present) in missing.into_iter() {
         // Recompute index map after previous inserts.
         offline_user_idx.clear();
         for (i, block) in blocks.iter().enumerate() {

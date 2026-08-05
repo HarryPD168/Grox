@@ -29,6 +29,11 @@ pub struct HostPrefs {
     /// Optional override for absolute turn ceiling (hours).
     #[serde(default)]
     pub prompt_absolute_hours: Option<u32>,
+    /// One-shot latch: FE→host CU migration already ran (0.2.25).
+    /// Without this, re-enabling localStorage after intentional host opt-out
+    /// silently re-opens the host gate on every boot (review P1).
+    #[serde(default)]
+    pub computer_use_fe_migrated: bool,
 }
 
 fn default_permission_mode() -> String {
@@ -87,12 +92,18 @@ pub fn save_prefs(app_data: &Path, prefs: &HostPrefs) -> Result<(), String> {
 }
 
 /// Silent one-shot migration: FE had CU on, host never set (0.2.20).
+/// After the first migration attempt, `computer_use_fe_migrated` stays true so
+/// later boots cannot re-open the host gate from localStorage alone.
 pub fn migrate_computer_use_from_fe(app_data: &Path, fe_enabled: bool) -> Result<HostPrefs, String> {
     let mut prefs = load_prefs(app_data);
+    if prefs.computer_use_fe_migrated {
+        return Ok(prefs);
+    }
     if fe_enabled && !prefs.computer_use_enabled {
         prefs.computer_use_enabled = true;
-        save_prefs(app_data, &prefs)?;
     }
+    prefs.computer_use_fe_migrated = true;
+    save_prefs(app_data, &prefs)?;
     Ok(prefs)
 }
 
@@ -145,9 +156,28 @@ mod tests {
         save_prefs(&dir, &p).unwrap();
         let out = migrate_computer_use_from_fe(&dir, true).unwrap();
         assert!(out.computer_use_enabled);
+        assert!(out.computer_use_fe_migrated);
         // Second migrate is no-op keep true.
         let out2 = migrate_computer_use_from_fe(&dir, false).unwrap();
         assert!(out2.computer_use_enabled);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrate_does_not_reopen_after_host_opt_out() {
+        let dir = temp_dir();
+        let _ = fs::remove_dir_all(&dir);
+        // First boot: FE had CU on → migrate opens host gate once.
+        let out = migrate_computer_use_from_fe(&dir, true).unwrap();
+        assert!(out.computer_use_enabled);
+        // Operator opts out on host.
+        let mut off = out;
+        off.computer_use_enabled = false;
+        save_prefs(&dir, &off).unwrap();
+        // localStorage still "1" must not re-open gate.
+        let again = migrate_computer_use_from_fe(&dir, true).unwrap();
+        assert!(!again.computer_use_enabled);
+        assert!(again.computer_use_fe_migrated);
         let _ = fs::remove_dir_all(&dir);
     }
 }
