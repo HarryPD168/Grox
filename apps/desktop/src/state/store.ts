@@ -87,10 +87,32 @@ const offlineHistoryComplete = new Set<string>();
 const offlineHistoryScanning = new Set<string>();
 /**
  * After a desktop shell upgrade: force full offline rescan even when fingerprint
- * UI transcript is still "fresh" (mtime match). Cleared after the first successful
- * complete scan this process, or when the process exits.
+ * UI transcript is still "fresh". Generation stays true until next version pin;
+ * per-session once via `upgradeForceRescanned` (0.2.30 — not every open forever).
  */
 let upgradeForceOfflineRescan = false;
+/** Sessions that already completed a force rescan in this upgrade generation. */
+const upgradeForceRescanned = new Set<string>();
+
+function forceScanForSession(id: string): boolean {
+  return shouldForceOfflineRescan({
+    upgradeRescanActive: upgradeForceOfflineRescan,
+    sessionAlreadyForceRescanned: upgradeForceRescanned.has(id),
+  });
+}
+
+function markOfflineHistoryComplete(id: string): void {
+  offlineHistoryComplete.add(id);
+  if (upgradeForceOfflineRescan) {
+    upgradeForceRescanned.add(id);
+  }
+}
+
+function activateUpgradeForceRescan(): void {
+  upgradeForceOfflineRescan = true;
+  upgradeForceRescanned.clear();
+  offlineHistoryComplete.clear();
+}
 /**
  * Sessions deleted this process lifetime — late disk-history events must not
  * resurrect them into `sessions` (R3 tombstone).
@@ -369,7 +391,7 @@ function startOfflineScanPoll(sessionId: string): void {
           !liveBusyNow &&
           (phase === "complete" || phase === "no-updates" || phase === "missing")
         ) {
-          offlineHistoryComplete.add(sessionId);
+          markOfflineHistoryComplete(sessionId);
         }
         // cancelled/error: drop banner only — allow retry on next open.
         if (
@@ -2240,7 +2262,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
     const merged = mergeOfflineWithLive(pending, cur);
     set({ sessions: { ...get().sessions, [sessionId]: merged } });
     if (merged.blocks.length > 0) scheduleSaveSessionCache(merged);
-    offlineHistoryComplete.add(sessionId);
+    markOfflineHistoryComplete(sessionId);
   }
 
   return {
@@ -2415,18 +2437,15 @@ export const useDesktop = create<DesktopState>((set, get) => {
                     if (merged.blocks.length > 0) scheduleSaveSessionCache(merged);
                   }
                   if (phaseComplete) {
-                    offlineHistoryComplete.add(payload.id);
-                    // Keep upgradeForceOfflineRescan for the whole process so
-                    // every mission opened after shell upgrade gets a real scan
-                    // (cleared only on next version pin via consumeShellUpgradeRescan).
+                    markOfflineHistoryComplete(payload.id);
                   }
                 }, 0);
               }
             } else if (phaseComplete && !liveBusy) {
-              offlineHistoryComplete.add(payload.id);
+              markOfflineHistoryComplete(payload.id);
             }
           } else if (phaseComplete && !liveBusy) {
-            offlineHistoryComplete.add(payload.id);
+            markOfflineHistoryComplete(payload.id);
           }
 
           if (get().fullHistoryLoadingId === payload.id && get().historyLoadMode === "disk") {
@@ -2544,8 +2563,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
             if (ver) {
               set({ appVersion: ver });
               if (consumeShellUpgradeRescan(ver)) {
-                upgradeForceOfflineRescan = true;
-                offlineHistoryComplete.clear();
+                activateUpgradeForceRescan();
               }
             }
           } catch {
@@ -2631,8 +2649,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         const info = await invoke<AppUpdateInfo>("check_app_update");
         const ver = info.currentVersion || get().appVersion;
         if (ver && consumeShellUpgradeRescan(ver)) {
-          upgradeForceOfflineRescan = true;
-          offlineHistoryComplete.clear();
+          activateUpgradeForceRescan();
         }
         set({
           appUpdate: info,
@@ -2796,7 +2813,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
           // an in-flight scan (that killed the worker and froze the progress bar).
           // Upgrade force must pass force:true (same as full open) so Wave-1
           // fingerprint cannot re-serve a pre-enrich transcript (review P0).
-          const forceScan = upgradeForceOfflineRescan;
+          const forceScan = forceScanForSession(id);
           const needScan =
             forceScan ||
             (!offlineHistoryComplete.has(id) &&
@@ -2874,7 +2891,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
           if (offlineHistoryDeleted.has(id)) return;
           // Upgrade generation must re-scan even if a prior fingerprint "complete"
           // was recorded earlier in this process (Wave-1 would otherwise no-op).
-          const forceScan = upgradeForceOfflineRescan;
+          const forceScan = forceScanForSession(id);
           if (offlineHistoryComplete.has(id) && !forceScan) return;
           if (forceScan) offlineHistoryComplete.delete(id);
           // Already scanning this id — join poll, do not re-invoke.
@@ -2997,12 +3014,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         };
 
         // Post-upgrade: drop stale FE bind so the next send rehydrates cleanly.
-        if (
-          shouldForceOfflineRescan({
-            upgradeRescanActive: upgradeForceOfflineRescan,
-            alreadyComplete: offlineHistoryComplete.has(id),
-          })
-        ) {
+        if (forceScanForSession(id)) {
           bridge.resetSessionBind?.(id);
           offlineHistoryComplete.delete(id);
         }
@@ -3010,11 +3022,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         // 1) Memory hit (may already be full if offline scan or send finished earlier)
         if (has) {
           const needRescan =
-            !offlineHistoryComplete.has(id) ||
-            shouldForceOfflineRescan({
-              upgradeRescanActive: upgradeForceOfflineRescan,
-              alreadyComplete: offlineHistoryComplete.has(id),
-            });
+            !offlineHistoryComplete.has(id) || forceScanForSession(id);
           if (needRescan) offlineHistoryComplete.delete(id);
           applyChrome(has, { loadingDisk: needRescan });
           kickOfflineHistory(has);
@@ -3031,10 +3039,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
             if (raw) {
               const transcript = normalizeOfflineSession(JSON.parse(raw) as Session);
               if (transcript && transcript.id === id && transcript.blocks.length > 0) {
-                const forceRescan = shouldForceOfflineRescan({
-                  upgradeRescanActive: upgradeForceOfflineRescan,
-                  alreadyComplete: false,
-                });
+                const forceRescan = forceScanForSession(id);
                 if (forceRescan) {
                   // Paint fast snapshot, but keep scanning so chrome is honest.
                   applyChrome(transcript, { loadingDisk: true });
@@ -3043,7 +3048,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
                   kickWarmAgentBind(id);
                   return;
                 }
-                offlineHistoryComplete.add(id);
+                markOfflineHistoryComplete(id);
                 applyChrome(transcript, { loadingDisk: false });
                 scheduleSaveSessionCache(transcript);
                 kickWarmAgentBind(id);

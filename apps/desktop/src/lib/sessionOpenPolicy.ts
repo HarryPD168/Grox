@@ -8,6 +8,9 @@
  * *painted* snapshot is truncated / pre-upgrade shaped; openSession then marks
  * offlineHistoryComplete and skips the full disk rescan. A cold restart often
  * races differently or picks a fresher path — feels like "must close window".
+ *
+ * 0.2.30: force is **per-session once** within the upgrade generation — not a
+ * process-wide permanent Wave-1 bypass for every mission (perf on multi-open).
  */
 
 export const SHELL_VERSION_STORAGE_KEY = "grox.lastShellVersion";
@@ -29,14 +32,18 @@ export function consumeShellUpgradeRescan(currentVersion: string): boolean {
 /**
  * When true, openSession must not treat fingerprint UI transcript as final —
  * paint it for speed, but still kick the full offline scan and re-bind on send.
+ *
+ * `sessionAlreadyForceRescanned`: this mission already completed a force scan
+ * in the current upgrade generation — do not force again.
  */
 export function shouldForceOfflineRescan(args: {
   upgradeRescanActive: boolean;
-  alreadyComplete: boolean;
+  sessionAlreadyForceRescanned?: boolean;
+  /** @deprecated unused — kept for call-site compatibility during 0.2.x */
+  alreadyComplete?: boolean;
 }): boolean {
   if (!args.upgradeRescanActive) return false;
-  // Even if this process already marked complete from a fingerprint hit, upgrade
-  // generation still wants a real scan once.
+  if (args.sessionAlreadyForceRescanned) return false;
   return true;
 }
 

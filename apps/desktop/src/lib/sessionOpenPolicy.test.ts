@@ -28,19 +28,31 @@ describe("consumeShellUpgradeRescan", () => {
   });
 });
 
-describe("shouldForceOfflineRescan", () => {
-  it("forces when upgrade generation is active", () => {
+describe("shouldForceOfflineRescan (0.2.30 per-session)", () => {
+  it("forces when upgrade active and session not yet force-rescanned", () => {
     expect(
-      shouldForceOfflineRescan({ upgradeRescanActive: true, alreadyComplete: false }),
+      shouldForceOfflineRescan({
+        upgradeRescanActive: true,
+        sessionAlreadyForceRescanned: false,
+      }),
     ).toBe(true);
+  });
+
+  it("does not force the same session twice in one upgrade generation", () => {
     expect(
-      shouldForceOfflineRescan({ upgradeRescanActive: true, alreadyComplete: true }),
-    ).toBe(true);
+      shouldForceOfflineRescan({
+        upgradeRescanActive: true,
+        sessionAlreadyForceRescanned: true,
+      }),
+    ).toBe(false);
   });
 
   it("does not force when upgrade generation is inactive", () => {
     expect(
-      shouldForceOfflineRescan({ upgradeRescanActive: false, alreadyComplete: false }),
+      shouldForceOfflineRescan({
+        upgradeRescanActive: false,
+        sessionAlreadyForceRescanned: false,
+      }),
     ).toBe(false);
   });
 });

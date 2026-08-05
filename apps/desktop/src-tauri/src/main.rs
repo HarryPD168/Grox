@@ -6107,9 +6107,7 @@ fn start_offline_session_history(
             let mut line_i = 0usize;
             const MAX_SCAN_BLOCKS: usize = 1500;
             let trim_blocks = |blocks: &mut Vec<serde_json::Value>| {
-                if blocks.len() > MAX_SCAN_BLOCKS {
-                    *blocks = blocks.split_off(blocks.len() - MAX_SCAN_BLOCKS);
-                }
+                trim_offline_blocks_at_user_boundary(blocks, MAX_SCAN_BLOCKS);
             };
             let mut last_progress_lines = 0usize;
             let mut last_progress_bytes = 0u64;
@@ -6577,11 +6575,9 @@ fn start_offline_session_history(
             }
 
             // Timeline windows initial paint; 1500 blocks covers long missions.
-            // Cap continuously during scan via push sites; final belt-and-braces here.
+            // Cap at a primary-user boundary so we never open mid-tool (0.2.30).
             const MAX_FINAL_BLOCKS: usize = 1500;
-            if blocks.len() > MAX_FINAL_BLOCKS {
-                blocks = blocks.split_off(blocks.len() - MAX_FINAL_BLOCKS);
-            }
+            trim_offline_blocks_at_user_boundary(&mut blocks, MAX_FINAL_BLOCKS);
             let packed = pack_offline_session(
                 &safe, &title_s, &cwd_s, &model_s, created_at, updated_at, &blocks,
             );
@@ -6724,6 +6720,39 @@ fn read_jsonl_line_capped_progress<R: BufRead>(
         consumed = consumed.saturating_add(chunk_len);
         *bytes_read = bytes_read.saturating_add(chunk_len as u64);
         heartbeat(*bytes_read);
+    }
+}
+
+/// Keep the last `max` offline blocks but never start mid-turn on a tool.
+/// Mirrors FE `sliceCacheBlocks` (0.2.23/0.2.30): walk back to a primary user.
+fn trim_offline_blocks_at_user_boundary(blocks: &mut Vec<serde_json::Value>, max: usize) {
+    if blocks.len() <= max {
+        return;
+    }
+    let mut start = blocks.len() - max;
+    // Walk back to nearest primary user (type=user, not interjected).
+    for i in (0..=start).rev() {
+        let is_primary_user = blocks[i].get("type").and_then(|t| t.as_str()) == Some("user")
+            && blocks[i]
+                .get("interjected")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+                == false;
+        if is_primary_user {
+            start = i;
+            break;
+        }
+        if i == 0 {
+            start = 0;
+            break;
+        }
+    }
+    // Cap growth if walk-back would keep almost everything (same as FE max*2).
+    if blocks.len() - start > max.saturating_mul(2) {
+        start = blocks.len() - max;
+    }
+    if start > 0 {
+        *blocks = blocks.split_off(start);
     }
 }
 
@@ -10110,6 +10139,31 @@ base_url = "https://ok.example"
         assert!(!acp_method_allowed("shell/exec"));
         assert!(!acp_method_allowed("eval"));
         assert!(!acp_method_allowed("_evil/hack"));
+    }
+
+    #[test]
+    fn trim_offline_blocks_starts_on_primary_user() {
+        let mut blocks = Vec::new();
+        for i in 0..20 {
+            if i % 5 == 0 {
+                blocks.push(serde_json::json!({
+                    "type": "user",
+                    "id": format!("u{i}"),
+                    "text": format!("msg {i}"),
+                }));
+            } else {
+                blocks.push(serde_json::json!({
+                    "type": "tool",
+                    "id": format!("t{i}"),
+                    "call": { "id": format!("c{i}"), "kind": "execute", "title": "run", "status": "done" }
+                }));
+            }
+        }
+        // max=8 raw slice starts mid-tools; user boundary should land on a user.
+        trim_offline_blocks_at_user_boundary(&mut blocks, 8);
+        assert_eq!(blocks[0].get("type").and_then(|t| t.as_str()), Some("user"));
+        assert!(blocks.len() >= 8);
+        assert!(blocks.len() <= 16);
     }
 
     #[test]
