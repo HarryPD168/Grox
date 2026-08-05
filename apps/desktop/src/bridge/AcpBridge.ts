@@ -61,7 +61,11 @@ import {
   shouldAutoApproveToolPermission,
 } from "../lib/permissionAuto";
 import { shouldDropSilentInbound } from "../lib/silentAcp";
-import { resolveFirstEventMs } from "../lib/firstEventWatch";
+import {
+  firstEventSoftWarnMessage,
+  resolveFirstEventMs,
+  shouldSoftWarnFirstEvent,
+} from "../lib/firstEventWatch";
 import {
   PROMPT_TURN_POLL_MS,
   isLiveTurnProgressUpdate,
@@ -1131,6 +1135,8 @@ export class AcpBridge implements GrokBridge {
    * - Else oldest visited unbound (A after B is complete).
    */
   private nextBackgroundLoadId(): string | null {
+    // 0.2.18: only warm-bind the *active* mission. Secondary visited loads
+    // contended the exclusive ACP channel and delayed multi-mission first-send.
     const active = this.activeSessionId();
     if (
       active &&
@@ -1138,12 +1144,6 @@ export class AcpBridge implements GrokBridge {
       !this.backgroundLoadFailed.has(active)
     ) {
       return active;
-    }
-    for (const id of this.visitedOrder) {
-      if (active && id === active) continue;
-      if (this.knownSessions.has(id)) continue;
-      if (this.backgroundLoadFailed.has(id)) continue;
-      return id;
     }
     return null;
   }
@@ -2180,13 +2180,33 @@ export class AcpBridge implements GrokBridge {
     }
   }
 
-  /** Best-effort sticky-stop Computer Use when a turn is killed (Stop / timeout). */
+  /**
+   * Sticky-stop Computer Use when a turn is killed (Stop / timeout).
+   * 0.2.17: fail-closed — if emergency_stop fails (or lease missing while
+   * session is marked active), revoke process-wide MCP bearer.
+   */
   private stickyStopComputerIfNeeded(sessionId: string): void {
     const leaseId = this.computerLeases.get(sessionId);
-    if (!leaseId && !this.activeComputerSessions.has(sessionId)) return;
+    const activeMarked = this.activeComputerSessions.has(sessionId);
+    if (!leaseId && !activeMarked) return;
     if (leaseId) {
-      void invoke("computer_emergency_stop", { leaseId }).catch(() => {});
+      void invoke("computer_emergency_stop", { leaseId })
+        .catch(() => invoke("computer_revoke_http_auth"))
+        .finally(() => {
+          this.computerLeases.delete(sessionId);
+          this.activeComputerSessions.delete(sessionId);
+          for (const key of [...this.activeComputerToolCalls]) {
+            if (key.startsWith(`${sessionId}:`)) this.activeComputerToolCalls.delete(key);
+          }
+        });
+      return;
     }
+    // Marked active without a lease id — still cut bearer.
+    this.activeComputerSessions.delete(sessionId);
+    for (const key of [...this.activeComputerToolCalls]) {
+      if (key.startsWith(`${sessionId}:`)) this.activeComputerToolCalls.delete(key);
+    }
+    void invoke("computer_revoke_http_auth").catch(() => {});
   }
 
   private onNotification(method: string, paramsValue: unknown) {
@@ -2871,6 +2891,7 @@ export class AcpBridge implements GrokBridge {
     const firstEventMs = opts.firstEventMs ?? resolveFirstEventMs(false);
     return new Promise<unknown>((resolve, reject) => {
       let settled = false;
+      let softWarned = false;
       const finish = (fn: () => void) => {
         if (settled) return;
         settled = true;
@@ -2927,10 +2948,25 @@ export class AcpBridge implements GrokBridge {
           finish(() => reject(new Error("回合已取消")));
           return;
         }
+        const now = Date.now();
+        const lastActivityAt = this.liveTurnActivityAt.get(sessionId) ?? 0;
+        const hasFirstEvent = lastActivityAt >= writtenAt && lastActivityAt > 0;
+        // 0.2.18: one soft info (not hard error) while post-bind grace is active.
+        if (
+          shouldSoftWarnFirstEvent({
+            elapsedMs: now - writtenAt,
+            firstEventMs,
+            hasFirstEvent,
+            alreadyWarned: softWarned,
+          })
+        ) {
+          softWarned = true;
+          this.emitSoftInfo(sessionId, firstEventSoftWarnMessage(firstEventMs));
+        }
         const reason = shouldExpirePromptTurn({
-          now: Date.now(),
+          now,
           writtenAt,
-          lastActivityAt: this.liveTurnActivityAt.get(sessionId) ?? 0,
+          lastActivityAt,
           hasOpenTools: this.hasOpenTools(sessionId),
           hasOpenGate: this.hasOpenInteraction(sessionId),
           firstEventMs,
@@ -2997,6 +3033,24 @@ export class AcpBridge implements GrokBridge {
         text: message,
         ts: Date.now(),
         kind: "error",
+      },
+    });
+  }
+
+  /**
+   * Soft system info — never forces idle, never parks queue (kind=info).
+   * Used for first-event soft warn under post-bind grace (0.2.18).
+   */
+  private emitSoftInfo(sessionId: string, message: string): void {
+    this.emit({
+      type: "block_add",
+      sessionId,
+      block: {
+        type: "system",
+        id: uid(),
+        text: message,
+        ts: Date.now(),
+        kind: "info",
       },
     });
   }

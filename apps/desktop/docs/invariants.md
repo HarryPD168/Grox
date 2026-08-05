@@ -25,6 +25,9 @@ Focus suites: `permissionAuto`, `queueTurnPolicy`, `promptQueue`, `sessionGate`,
 | I-13 | Live progress excludes `user_message_chunk` / mode-only updates (zero-event purity) |
 | I-14 | Open session may silent warm-bind the **active** mission only (no UI replay flood); first-send awaits the same `loadPromises` if still in flight |
 | I-15 | Background silent bind must not start while a live primary/concurrent turn is bookkept |
+| I-16 | Stop / FE timeout parks local queue; operator must **Resume queue** or send again (no surprise auto-drain) |
+| I-17 | First-event soft warn (post-bind) is `kind: info` only — must not match timeout classifier / park queue |
+| I-18 | CU sticky stop on kill is fail-closed (emergency_stop failure → revoke bearer) |
 
 ## UI honesty
 

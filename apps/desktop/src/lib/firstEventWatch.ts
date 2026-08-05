@@ -33,6 +33,30 @@ export function resolveFirstEventMs(postBindGrace: boolean): number {
   return postBindGrace ? POST_BIND_FIRST_EVENT_MS : FIRST_EVENT_STALL_MS;
 }
 
+/**
+ * Soft mid-wait notice at the warm stall threshold while a longer post-bind
+ * budget is still active (0.2.18). Must NOT match `isPromptTurnTimeoutMessage`
+ * (no 自动终止 / 无事件返回 / …) so store does not park the queue.
+ */
+export function firstEventSoftWarnMessage(firstEventMs: number): string {
+  const hardSeconds = Math.max(1, Math.round(firstEventMs / 1000));
+  const softSeconds = Math.max(1, Math.round(FIRST_EVENT_STALL_MS / 1000));
+  return `首包仍在等待（已过 ${softSeconds}s；本回合宽限至 ${hardSeconds}s）。大会话绑定后较常见，可继续等待或点停止。`;
+}
+
+/** True when a soft warn should fire before hard first_event kill. */
+export function shouldSoftWarnFirstEvent(args: {
+  elapsedMs: number;
+  firstEventMs: number;
+  hasFirstEvent: boolean;
+  alreadyWarned: boolean;
+}): boolean {
+  if (args.alreadyWarned || args.hasFirstEvent) return false;
+  // Only when hard budget is longer than the warm stall (post-bind grace).
+  if (args.firstEventMs <= FIRST_EVENT_STALL_MS) return false;
+  return args.elapsedMs >= FIRST_EVENT_STALL_MS;
+}
+
 export type BlockLike = {
   type: string;
   interjected?: boolean;

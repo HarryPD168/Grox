@@ -2,9 +2,12 @@ import { describe, expect, it } from "vitest";
 import {
   FIRST_EVENT_STALL_MS,
   POST_BIND_FIRST_EVENT_MS,
+  firstEventSoftWarnMessage,
   isZeroEventLiveTurn,
   resolveFirstEventMs,
+  shouldSoftWarnFirstEvent,
 } from "./firstEventWatch";
+import { isPromptTurnTimeoutMessage } from "./promptTurnTimeout";
 
 describe("resolveFirstEventMs", () => {
   it("uses warm baseline when post-bind grace is off", () => {
@@ -16,6 +19,49 @@ describe("resolveFirstEventMs", () => {
     expect(resolveFirstEventMs(true)).toBe(POST_BIND_FIRST_EVENT_MS);
     expect(POST_BIND_FIRST_EVENT_MS).toBe(60_000);
     expect(POST_BIND_FIRST_EVENT_MS).toBeGreaterThan(FIRST_EVENT_STALL_MS);
+  });
+});
+
+describe("firstEvent soft warn (0.2.18)", () => {
+  it("fires once at warm threshold only under post-bind budget", () => {
+    expect(
+      shouldSoftWarnFirstEvent({
+        elapsedMs: FIRST_EVENT_STALL_MS,
+        firstEventMs: POST_BIND_FIRST_EVENT_MS,
+        hasFirstEvent: false,
+        alreadyWarned: false,
+      }),
+    ).toBe(true);
+    expect(
+      shouldSoftWarnFirstEvent({
+        elapsedMs: FIRST_EVENT_STALL_MS,
+        firstEventMs: FIRST_EVENT_STALL_MS,
+        hasFirstEvent: false,
+        alreadyWarned: false,
+      }),
+    ).toBe(false);
+    expect(
+      shouldSoftWarnFirstEvent({
+        elapsedMs: FIRST_EVENT_STALL_MS,
+        firstEventMs: POST_BIND_FIRST_EVENT_MS,
+        hasFirstEvent: true,
+        alreadyWarned: false,
+      }),
+    ).toBe(false);
+    expect(
+      shouldSoftWarnFirstEvent({
+        elapsedMs: FIRST_EVENT_STALL_MS,
+        firstEventMs: POST_BIND_FIRST_EVENT_MS,
+        hasFirstEvent: false,
+        alreadyWarned: true,
+      }),
+    ).toBe(false);
+  });
+
+  it("copy must not park queue via timeout classifier", () => {
+    const msg = firstEventSoftWarnMessage(POST_BIND_FIRST_EVENT_MS);
+    expect(isPromptTurnTimeoutMessage(msg)).toBe(false);
+    expect(msg).toMatch(/宽限/);
   });
 });
 

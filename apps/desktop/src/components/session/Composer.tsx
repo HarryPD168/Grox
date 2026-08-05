@@ -86,10 +86,14 @@ export function Composer() {
   const removeQueuedPrompt = useDesktop((s) => s.removeQueuedPrompt);
   const reorderQueuedPrompt = useDesktop((s) => s.reorderQueuedPrompt);
   const clearPromptQueue = useDesktop((s) => s.clearPromptQueue);
+  const resumePromptQueue = useDesktop((s) => s.resumePromptQueue);
   const interjectQueuedPrompt = useDesktop((s) => s.interjectQueuedPrompt);
   const editQueuedPrompt = useDesktop((s) => s.editQueuedPrompt);
   const queueNotice = useDesktop((s) => s.queueNotice);
   const dismissQueueNotice = useDesktop((s) => s.dismissQueueNotice);
+  const queueParked = useDesktop((s) =>
+    s.activeId ? Boolean(s.queueDrainParked[s.activeId]) : false,
+  );
   const [queueDragIndex, setQueueDragIndex] = useState<number | null>(null);
   const [queueDropIndex, setQueueDropIndex] = useState<number | null>(null);
   const [interjecting, setInterjecting] = useState(false);
@@ -602,9 +606,25 @@ export function Composer() {
               <>
                 <div className="flex h-8 items-center justify-between border-b border-line px-3">
                   <span className="text-[12px] font-medium text-mute">
-                    {zh ? `队列 ${queue.length}` : `Queued ${queue.length}`}
+                    {zh
+                      ? `队列 ${queue.length}${queueParked && !turnActive ? " · 已暂停" : ""}`
+                      : `Queued ${queue.length}${queueParked && !turnActive ? " · paused" : ""}`}
                   </span>
                   <div className="flex items-center gap-2">
+                    {queueParked && !turnActive && (
+                      <button
+                        type="button"
+                        onClick={() => activeId && resumePromptQueue(activeId)}
+                        className="rounded-md bg-acc/15 px-2 py-0.5 text-[11.5px] font-medium text-acc transition-colors hover:bg-acc/25"
+                        title={
+                          zh
+                            ? "解除暂停并发送队首"
+                            : "Unpark and send queue head"
+                        }
+                      >
+                        {zh ? "继续发送队列" : "Resume queue"}
+                      </button>
+                    )}
                     {queue.length > 1 && (
                       <span className="text-[11px] text-faint">
                         {zh ? "拖拽或箭头调整顺序" : "Drag or arrows to reorder"}
@@ -632,7 +652,7 @@ export function Composer() {
                     const isDragging = queueDragIndex === index;
                     const isDropTarget =
                       queueDropIndex === index && queueDragIndex !== null && queueDragIndex !== index;
-                    // Local parked follow-ups wait for idle drain (same as heldByCli).
+                    // Local parked follow-ups: Stop/timeout park vs waiting on live turn.
                     const stateLabel = item.heldByCli
                       ? zh
                         ? "等待当前回合结束"
@@ -645,9 +665,13 @@ export function Composer() {
                           ? zh
                             ? "发送中"
                             : "Sending"
-                          : zh
-                            ? "等待当前回合结束"
-                            : "Waiting for turn";
+                          : queueParked && !turnActive
+                            ? zh
+                              ? "已暂停 · 可继续发送"
+                              : "Paused · resume to send"
+                            : zh
+                              ? "等待当前回合结束"
+                              : "Waiting for turn";
                     return (
                       <div
                         key={item.id}

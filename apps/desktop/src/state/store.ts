@@ -146,6 +146,26 @@ const suppressNextIdleDrain = new Set<string>();
  */
 const drainInFlight = new Set<string>();
 
+/** Reactive mirror of suppressNextIdleDrain for Composer (0.2.17). */
+function mirrorQueueDrainParked(
+  set: (partial: { queueDrainParked: Record<string, boolean> }) => void,
+  get: () => { queueDrainParked: Record<string, boolean> },
+  sessionId: string,
+  parked: boolean,
+): void {
+  if (parked) {
+    suppressNextIdleDrain.add(sessionId);
+    if (get().queueDrainParked[sessionId]) return;
+    set({ queueDrainParked: { ...get().queueDrainParked, [sessionId]: true } });
+    return;
+  }
+  suppressNextIdleDrain.delete(sessionId);
+  if (!get().queueDrainParked[sessionId]) return;
+  const next = { ...get().queueDrainParked };
+  delete next[sessionId];
+  set({ queueDrainParked: next });
+}
+
 /** True when this send IIFE was superseded by Stop / a newer primary. */
 function isPromptFlightCancelled(sessionId: string, flightGen: number): boolean {
   return promptFlightGen.get(sessionId) !== flightGen;
@@ -614,6 +634,11 @@ interface DesktopState {
   sandboxPendingApply: boolean;
   sessionComposers: Record<string, SessionComposerState>;
   promptQueues: Record<string, QueuedPrompt[]>;
+  /**
+   * Sessions whose local queue is parked after Stop / FE timeout (0.2.17).
+   * Reactive mirror of suppressNextIdleDrain — Composer shows「继续发送队列」.
+   */
+  queueDrainParked: Record<string, boolean>;
   /** Last queue/interject/gate receipt shown above the composer. */
   queueNotice: QueueNotice | null;
 
@@ -720,6 +745,11 @@ interface DesktopState {
   /** Reorder a pending follow-up before it drains (fromIndex → toIndex). */
   reorderQueuedPrompt(sessionId: string, fromIndex: number, toIndex: number): void;
   clearPromptQueue(sessionId?: string): void;
+  /**
+   * Unpark a Stop/timeout-held queue and drain the head (0.2.17).
+   * No-op when empty or session not idle.
+   */
+  resumePromptQueue(sessionId?: string): void;
   /** Promote a queued entry to front and mark it for interjection drain order. */
   interjectQueuedPrompt(sessionId: string, queueId: string): void;
   /** Inline-edit a queued message (local + x.ai/queue/edit). */
@@ -1536,8 +1566,8 @@ export const useDesktop = create<DesktopState>((set, get) => {
                   queueNotice: {
                     id: uid(),
                     message: tOp(
-                      `已停止；队列仍保留 ${n} 条（不会自动发送，可清空或继续输入后发送）`,
-                      `Stopped; ${n} queue item(s) kept (will not auto-send — clear or send again)`,
+                      `已停止；队列仍保留 ${n} 条（不会自动发送 — 点「继续发送队列」或再发一条消息）`,
+                      `Stopped; ${n} queue item(s) kept — use Resume queue or send a new message`,
                     ),
                     state: "blocked",
                     at: Date.now(),
@@ -1591,7 +1621,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
           !softQueueFail && !softCancel && isPromptTurnTimeoutMessage(e.message);
         if (isTurnTimeout) {
           // Park queue like Stop — auto-drain after FE kill is surprising (R2).
-          suppressNextIdleDrain.add(e.sessionId);
+          mirrorQueueDrainParked(set, get, e.sessionId, true);
           const n = (get().promptQueues[e.sessionId] ?? []).length;
           set({
             queueNotice: {
@@ -1599,8 +1629,8 @@ export const useDesktop = create<DesktopState>((set, get) => {
               message:
                 n > 0
                   ? tOp(
-                      `${e.message}（队列仍保留 ${n} 条，不会自动发送）`,
-                      `${e.message} (${n} queue item(s) kept — will not auto-send)`,
+                      `${e.message}（队列仍保留 ${n} 条 — 点「继续发送队列」可恢复）`,
+                      `${e.message} (${n} queue item(s) kept — Resume queue to continue)`,
                     )
                   : e.message,
               state: "blocked",
@@ -1653,6 +1683,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         consumedConcurrentTextsBySession.clear();
         // Reconnect is a clean slate — allow queue drain again.
         suppressNextIdleDrain.clear();
+        set({ queueDrainParked: {} });
         // Invalidate in-flight concurrent enqueue IIFEs (pre-reconnect awaits).
         for (const id of Object.keys(get().sessions)) {
           bumpConcurrentEnqueueEpoch(id);
@@ -1989,8 +2020,14 @@ export const useDesktop = create<DesktopState>((set, get) => {
       return;
     }
 
-    // Operator Stop / FE auto-timeout: park queue until they re-send or clear.
+    // Operator Stop / FE auto-timeout: park queue until they resume or clear.
     if (suppressNextIdleDrain.has(sessionId)) {
+      return;
+    }
+
+    // 0.2.17: do not drain while silent agent bind banner is up (status may still
+    // be idle — dual primary race during first-send bind).
+    if (get().historyLoadMode === "agent" && get().fullHistoryLoadingId === sessionId) {
       return;
     }
 
@@ -2241,6 +2278,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
     sandboxPendingApply: false,
     sessionComposers: loadSessionComposers(),
     promptQueues: {},
+    queueDrainParked: {},
     queueNotice: null,
 
     inspectorOpen: true,
@@ -3610,7 +3648,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
       hideSessionId(id);
       pendingOfflineMerge.delete(id);
       releasePromptFlight(id);
-      suppressNextIdleDrain.add(id);
+      mirrorQueueDrainParked(set, get, id, true);
       clearConsumedConcurrent(id);
       for (const entry of get().promptQueues[id] ?? []) {
         submittedEnqueueIds.delete(entry.id);
@@ -3666,7 +3704,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
       try {
         await bridge.deleteSession(id);
       } finally {
-        suppressNextIdleDrain.delete(id);
+        mirrorQueueDrainParked(set, get, id, false);
       }
     },
 
@@ -3857,7 +3895,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
 
       // Operator is actively continuing — allow queue drain after this turn ends,
       // and reset concurrent-consumed fingerprints for a fresh primary turn.
-      suppressNextIdleDrain.delete(session.id);
+      mirrorQueueDrainParked(set, get, session.id, false);
       clearConsumedConcurrent(session.id);
 
       // Claim the in-flight slot before any await/set so double-click cannot dual-paint.
@@ -4277,7 +4315,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
       if (!id) return;
       const had = (get().promptQueues[id] ?? []).length > 0;
       // Clearing queue also drops any stop-suppress so a later idle is clean.
-      suppressNextIdleDrain.delete(id);
+      mirrorQueueDrainParked(set, get, id, false);
       for (const entry of get().promptQueues[id] ?? []) {
         submittedEnqueueIds.delete(entry.id);
       }
@@ -4357,6 +4395,54 @@ export const useDesktop = create<DesktopState>((set, get) => {
       set({ queueNotice: null });
     },
 
+    resumePromptQueue(sessionId) {
+      const id = sessionId ?? get().activeId;
+      if (!id) return;
+      const n = (get().promptQueues[id] ?? []).length;
+      if (n === 0) {
+        mirrorQueueDrainParked(set, get, id, false);
+        return;
+      }
+      // Unpark then drain head (session must be idle — drainPromptQueue enforces).
+      mirrorQueueDrainParked(set, get, id, false);
+      set({
+        queueNotice: {
+          id: uid(),
+          message: tOp("正在恢复队列发送…", "Resuming queue…"),
+          state: "queued",
+          at: Date.now(),
+        },
+      });
+      drainPromptQueue(id);
+      // If still parked-empty or not idle, tell the operator why nothing fired.
+      if (suppressNextIdleDrain.has(id)) return;
+      const session = get().sessions[id];
+      const left = (get().promptQueues[id] ?? []).length;
+      if (session?.status !== "idle" && left > 0) {
+        set({
+          queueNotice: {
+            id: uid(),
+            message: tOp(
+              "当前回合未结束，队列将在就绪后继续（已取消暂停）",
+              "Turn still active — queue will drain when idle (park cleared)",
+            ),
+            state: "queued",
+            at: Date.now(),
+          },
+        });
+      } else if (left === n && session?.status === "idle") {
+        // Drain no-op (e.g. only CLI rows) — still unparked for later.
+        set({
+          queueNotice: {
+            id: uid(),
+            message: tOp("队列已解除暂停", "Queue unparked"),
+            state: "queued",
+            at: Date.now(),
+          },
+        });
+      }
+    },
+
     stop() {
       const { activeId } = get();
       if (!activeId) return;
@@ -4367,7 +4453,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
       }
       releasePromptFlight(activeId);
       // Park queue: cancel→idle must not immediately drain the next follow-up.
-      suppressNextIdleDrain.add(activeId);
+      mirrorQueueDrainParked(set, get, activeId, true);
       bridge.cancel(activeId);
     },
 
