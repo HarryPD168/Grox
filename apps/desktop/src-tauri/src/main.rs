@@ -4622,17 +4622,14 @@ Use only the grok_desktop_computer MCP tools for an explicit `/computer` or `@Co
     Ok(root)
 }
 
-/// Product gate shared by the tauri command (unit-testable).
-/// Host-attested prefs (native file) + FE flag + env (0.2.19).
-fn computer_use_gate_open(operator_enabled: Option<bool>) -> bool {
+/// Product gate (0.2.20): **env OR host_prefs only**.
+/// FE `operator_enabled` is intentionally ignored so localStorage/DevTools
+/// cannot open Computer Use without host-attested prefs (or GROX_COMPUTER_USE).
+fn computer_use_gate_open(_operator_enabled: Option<bool>) -> bool {
     if computer_use_env_enabled() {
         return true;
     }
-    if operator_enabled == Some(true) {
-        return true;
-    }
-    // Host-attested native prefs (not only webview localStorage).
-    host_prefs::load_prefs(&host_prefs_app_data_dir()).computer_use_enabled
+    host_prefs::is_computer_use_enabled()
 }
 
 /// Resolve app data dir for host prefs (best-effort without AppHandle).
@@ -4684,6 +4681,12 @@ fn host_prefs_dir_for_app(app: &tauri::AppHandle) -> PathBuf {
 #[tauri::command]
 fn host_prefs_get(app: tauri::AppHandle) -> host_prefs::HostPrefs {
     host_prefs::load_prefs(&host_prefs_dir_for_app(&app))
+}
+
+/// One-shot: if FE had CU on and host never did, write host without dialog (0.2.20).
+#[tauri::command]
+fn host_prefs_migrate_computer_use(app: tauri::AppHandle, fe_enabled: bool) -> Result<host_prefs::HostPrefs, String> {
+    host_prefs::migrate_computer_use_from_fe(&host_prefs_dir_for_app(&app), fe_enabled)
 }
 
 /// Persist Computer Use opt-in on the host (native file). Enabling can prompt
@@ -4787,11 +4790,9 @@ fn computer_use_env_enabled_cmd() -> bool {
 
 #[tauri::command]
 fn computer_session_extensions(operator_enabled: Option<bool>) -> Result<ComputerSessionExtensions, String> {
-    // Product gate: Computer Use is opt-in (Settings / explicit flag). Env
-    // GROX_COMPUTER_USE=1 also enables for advanced operators.
-    // Soft-fail when closed: return empty MCP/plugin lists so session/new and
-    // session/load still succeed. Prompt-time attach (ensureComputerAttached)
-    // surfaces the opt-in message only when the user actually asks for CU.
+    // Product gate (0.2.20): host_prefs + env only. `operator_enabled` kept for
+    // ABI compatibility but does not open the gate (anti FE localStorage bypass).
+    // Soft-fail when closed: empty MCP so session/new and session/load still work.
     if !computer_use_gate_open(operator_enabled) {
         return Ok(ComputerSessionExtensions {
             mcp_servers: Vec::new(),
@@ -8523,6 +8524,9 @@ fn main() {
         .manage(Arc::new(AcpState::default()))
         .manage(Arc::new(PreviewState::default()))
         .setup(|app| {
+            // 0.2.20: pin host_prefs dir + fill process cache before any CU gate.
+            let prefs_dir = host_prefs_dir_for_app(app.handle());
+            let _ = host_prefs::load_prefs(&prefs_dir);
             let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/icon.png"))?;
             register_computer_emergency_shortcut(app.handle().clone());
             if let Err(error) = install_app_menu(app.handle()) {
@@ -8612,6 +8616,7 @@ fn main() {
             computer_session_extensions,
             computer_use_env_enabled_cmd,
             host_prefs_get,
+            host_prefs_migrate_computer_use,
             host_prefs_set_computer_use,
             host_prefs_set_permission_mode,
             host_prefs_set_prompt_timeouts,
@@ -8969,17 +8974,16 @@ api_key = "local-key"
 
     #[test]
     fn computer_use_gate_defaults_closed() {
-        // Without env/opt-in the gate must refuse (no MCP serve).
+        // Without env/host prefs the gate must refuse (no MCP serve).
         // Do not set_var here — process-global env races other parallel tests.
         assert!(!computer_use_env_flag(None));
         assert!(!computer_use_env_flag(Some("0")));
-        // Gate with explicit operator flag only (env path covered by flag unit test).
-        // When env is unset in this process, operator Some(true) still opens.
-        if !computer_use_env_enabled() {
+        // 0.2.20: FE operator_enabled alone must NOT open the gate.
+        if !computer_use_env_enabled() && !host_prefs::is_computer_use_enabled() {
             assert!(!computer_use_gate_open(None));
             assert!(!computer_use_gate_open(Some(false)));
+            assert!(!computer_use_gate_open(Some(true)));
         }
-        assert!(computer_use_gate_open(Some(true)));
     }
 
     #[test]

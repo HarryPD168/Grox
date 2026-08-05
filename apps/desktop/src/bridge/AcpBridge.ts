@@ -2182,30 +2182,33 @@ export class AcpBridge implements GrokBridge {
 
   /**
    * Sticky-stop Computer Use when a turn is killed (Stop / timeout).
-   * 0.2.17: fail-closed — if emergency_stop fails (or lease missing while
-   * session is marked active), revoke process-wide MCP bearer.
+   * 0.2.20: prefer per-lease emergency_stop; process-wide revoke only when
+   * no lease id (fail-closed) so multi-session CU is not always nuked.
    */
   private stickyStopComputerIfNeeded(sessionId: string): void {
     const leaseId = this.computerLeases.get(sessionId);
     const activeMarked = this.activeComputerSessions.has(sessionId);
     if (!leaseId && !activeMarked) return;
+    const clearSessionCu = () => {
+      this.computerLeases.delete(sessionId);
+      this.activeComputerSessions.delete(sessionId);
+      for (const key of [...this.activeComputerToolCalls]) {
+        if (key.startsWith(`${sessionId}:`)) this.activeComputerToolCalls.delete(key);
+      }
+    };
     if (leaseId) {
       void invoke("computer_emergency_stop", { leaseId })
-        .catch(() => invoke("computer_revoke_http_auth"))
+        .catch(() => {
+          // Per-lease failed — last resort process-wide (other sessions may share MCP).
+          return invoke("computer_revoke_http_auth");
+        })
         .finally(() => {
-          this.computerLeases.delete(sessionId);
-          this.activeComputerSessions.delete(sessionId);
-          for (const key of [...this.activeComputerToolCalls]) {
-            if (key.startsWith(`${sessionId}:`)) this.activeComputerToolCalls.delete(key);
-          }
+          clearSessionCu();
         });
       return;
     }
-    // Marked active without a lease id — still cut bearer.
-    this.activeComputerSessions.delete(sessionId);
-    for (const key of [...this.activeComputerToolCalls]) {
-      if (key.startsWith(`${sessionId}:`)) this.activeComputerToolCalls.delete(key);
-    }
+    // Marked active without a lease id — fail-closed with process-wide revoke.
+    clearSessionCu();
     void invoke("computer_revoke_http_auth").catch(() => {});
   }
 

@@ -13,6 +13,7 @@ import {
   setComputerUseHostPrefsEnabled,
 } from "../lib/computerUse";
 import { configurePromptTurnTimeouts } from "../lib/promptTurnTimeout";
+import { nextQueueDrainParked } from "../lib/queueParkPolicy";
 import { isFeatureEnabled } from "../lib/featureFlags";
 import { tOp } from "../lib/operatorLocale";
 import { isSafeMarkdownOpenUrl } from "../lib/openUrlSafety";
@@ -150,23 +151,17 @@ const suppressNextIdleDrain = new Set<string>();
  */
 const drainInFlight = new Set<string>();
 
-/** Reactive mirror of suppressNextIdleDrain for Composer (0.2.17). */
+/** Reactive mirror of suppressNextIdleDrain for Composer (0.2.17/0.2.20). */
 function mirrorQueueDrainParked(
   set: (partial: { queueDrainParked: Record<string, boolean> }) => void,
   get: () => { queueDrainParked: Record<string, boolean> },
   sessionId: string,
   parked: boolean,
 ): void {
-  if (parked) {
-    suppressNextIdleDrain.add(sessionId);
-    if (get().queueDrainParked[sessionId]) return;
-    set({ queueDrainParked: { ...get().queueDrainParked, [sessionId]: true } });
-    return;
-  }
-  suppressNextIdleDrain.delete(sessionId);
-  if (!get().queueDrainParked[sessionId]) return;
-  const next = { ...get().queueDrainParked };
-  delete next[sessionId];
+  if (parked) suppressNextIdleDrain.add(sessionId);
+  else suppressNextIdleDrain.delete(sessionId);
+  const next = nextQueueDrainParked(get().queueDrainParked, sessionId, parked);
+  if (next === get().queueDrainParked) return;
   set({ queueDrainParked: next });
 }
 
@@ -2447,8 +2442,18 @@ export const useDesktop = create<DesktopState>((set, get) => {
           bridge.getProviderStatus(),
         ]);
         // Host-attested prefs (Computer Use + permission + timeout overrides).
+        // 0.2.20: gate ignores FE-only localStorage; migrate former FE opt-in once.
         if (bridge.kind === "acp") {
           try {
+            let feCu = false;
+            try {
+              feCu = localStorage.getItem("grox.computerUseEnabled") === "1";
+            } catch {
+              /* ignore */
+            }
+            if (feCu) {
+              await invoke("host_prefs_migrate_computer_use", { feEnabled: true }).catch(() => {});
+            }
             const prefs = await invoke<{
               computerUseEnabled?: boolean;
               permissionMode?: string;

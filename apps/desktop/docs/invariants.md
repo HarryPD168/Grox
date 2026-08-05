@@ -31,6 +31,10 @@ Focus suites: `permissionAuto`, `queueTurnPolicy`, `promptQueue`, `sessionGate`,
 | I-19 | Windows ACP child is in a Job Object; terminate kills the process tree |
 | I-20 | Computer Use + Bypass prefer host-attested `host_prefs.json` (native confirm on enable) |
 | I-21 | Shell polls agent process liveness and emits `acp-exit` if the child dies silently |
+| I-22 | Offline history enrich reuses live block identities for matching content; Timeline idle pin must not flash mid-history on open |
+| I-23 | Computer Use gate = `GROX_COMPUTER_USE` env **or** host_prefs only (FE localStorage cannot open MCP) |
+| I-24 | host_prefs uses a single app_data path + process cache (set at startup) |
+| I-25 | Queue park always updates suppress set **and** `queueDrainParked` via one mirror helper |
 
 ## UI honesty
 

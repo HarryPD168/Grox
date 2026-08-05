@@ -481,7 +481,11 @@ export function Timeline({ session }: { session: Session }) {
    * scrollTop stable when content below grows; we only pin when follow is on.
    */
   const followRef = useRef(true);
+  /** True while we programmatically pin scroll — ignore onScroll unfollow (0.2.20). */
+  const pinningRef = useRef(false);
   const jumpTimersRef = useRef<number[]>([]);
+  /** Last session id we forced open-pin for (idle enrich must not re-open pin). */
+  const openPinnedSessionRef = useRef<string | null>(null);
   const turns = useMemo(() => groupTurns(session.blocks), [session.blocks]);
   /** true = show entire transcript (default for restored history). */
   const [showAll, setShowAll] = useState(true);
@@ -566,7 +570,14 @@ export function Timeline({ session }: { session: Session }) {
     if (!force && !followRef.current) return false;
     const el = scrollerRef.current;
     if (!el) return false;
+    pinningRef.current = true;
     el.scrollTop = el.scrollHeight;
+    // Clear after layout/scroll events from this pin have settled.
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        pinningRef.current = false;
+      });
+    });
     return true;
   }, []);
 
@@ -575,6 +586,7 @@ export function Timeline({ session }: { session: Session }) {
     setShowAll(true);
     followRef.current = true;
     setShowJumpLatest(false);
+    openPinnedSessionRef.current = session.id;
   }, [session.id]);
 
   // Offline scan / cache upgrade may add many older turns — keep them visible.
@@ -640,14 +652,20 @@ export function Timeline({ session }: { session: Session }) {
     jumpTimersRef.current.push(window.setTimeout(run, 160));
   };
 
-  // Pin to bottom only while follow is on (live stream / session open).
-  // useLayoutEffect: pin before paint so mid-turn block inserts cannot flash
-  // the viewport at scrollTop=0 / mid-history for a frame.
+  // Pin to bottom while follow is on.
+  // Live turns: pin on every stream stickKey (existing).
+  // Idle history enrich (offline scan ~1s after open): pin only if still following,
+  // with pinningRef so onScroll does not falsely unfollow mid-reflow (0.2.20).
   useLayoutEffect(() => {
     if (!hasBlocks) return;
     if (!followRef.current) return;
+    if (!isLive && openPinnedSessionRef.current === session.id) {
+      // Same session idle enrich — stay at bottom if user has not left.
+      scrollToBottom(true);
+      return;
+    }
     scrollToBottom(true);
-  }, [session.id, stickKey, visibleTurns.length, hasBlocks, scrollToBottom]);
+  }, [session.id, stickKey, visibleTurns.length, hasBlocks, scrollToBottom, isLive]);
 
   // Session open: force follow + bottom after late layout (images/fonts).
   useEffect(() => {
@@ -670,6 +688,7 @@ export function Timeline({ session }: { session: Session }) {
   }, [session.id]);
 
   const onScrollerScroll = useCallback(() => {
+    if (pinningRef.current) return;
     const el = scrollerRef.current;
     if (!el) return;
     const dist = el.scrollHeight - el.scrollTop - el.clientHeight;

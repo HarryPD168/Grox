@@ -93,6 +93,7 @@ describe("mergeOfflineWithLive", () => {
 
   it("does not duplicate when offline and live use different ids for same content", () => {
     // Disk scan uses stable ids; UI painted optimistic UUIDs for the same turns.
+    // 0.2.20: reuse live identities so Timeline does not remount/flash.
     const pending = sess({
       id: "a",
       status: "idle",
@@ -111,7 +112,29 @@ describe("mergeOfflineWithLive", () => {
     });
     const out = mergeOfflineWithLive(pending, cur);
     expect(out.blocks).toHaveLength(2);
-    expect(out.blocks.map((b) => b.id)).toEqual(["disk-u1", "disk-a1"]);
+    expect(out.blocks.map((b) => b.id)).toEqual(["uuid-u1", "uuid-a1"]);
+  });
+
+  it("stabilizes live ids while prepending offline-only older history", () => {
+    const pending = sess({
+      id: "a",
+      status: "idle",
+      blocks: [
+        { type: "user", id: "disk-old", text: "ancient", ts: 0 },
+        { type: "user", id: "disk-u1", text: "hello world", ts: 1 },
+        { type: "assistant", id: "disk-a1", text: "hi there", ts: 2, streaming: false },
+      ],
+    });
+    const cur = sess({
+      id: "a",
+      status: "idle",
+      blocks: [
+        { type: "user", id: "uuid-u1", text: "hello world", ts: 1 },
+        { type: "assistant", id: "uuid-a1", text: "hi there", ts: 2, streaming: false },
+      ],
+    });
+    const out = mergeOfflineWithLive(pending, cur);
+    expect(out.blocks.map((b) => b.id)).toEqual(["disk-old", "uuid-u1", "uuid-a1"]);
   });
 
   it("appends only a new live user turn after offline prefix (content-aware)", () => {

@@ -2,16 +2,20 @@
 
 Tracked after multi-agent R1/R2 review and platform-debt pass (0.2.19).
 
-## Done in 0.2.19
+## Done in 0.2.19–0.2.20
 
 | Item | Notes |
 |------|--------|
 | Windows Job Object for ACP child tree | Agent child assigned to job with `KILL_ON_JOB_CLOSE`; `terminate_process` calls `TerminateJobObject` before `child.kill` |
-| Computer Use host-attested opt-in | `host_prefs.json` + native confirm dialog; FE Settings writes via Tauri |
+| Computer Use host-attested opt-in | `host_prefs.json` + native confirm; **0.2.20 gate ignores FE `operator_enabled`** |
 | Bypass/YOLO host-attested | `host_prefs_set_permission_mode` + native confirm when enabling bypass |
 | Agent process liveness (shell heartbeat) | 15s `try_wait` poll; emits `acp-exit` if child dies silently |
-| Idle / absolute policy | Defaults remain 45m / 4h; overridable via `host_prefs` (`promptIdleMinutes` / `promptAbsoluteHours`) + `configurePromptTurnTimeouts` |
-| Cross-platform single-instance | Windows named mutex (existing); Unix exclusive `flock` on lock file |
+| Idle / absolute policy | Defaults remain 45m / 4h; overridable via `host_prefs` + `configurePromptTurnTimeouts` |
+| Cross-platform single-instance | Windows named mutex; Unix exclusive `flock` |
+| Open flash / offline enrich | **0.2.20** stabilize live block ids + Timeline pinningRef |
+| host_prefs path | **0.2.20** single app_data dir + process cache at startup |
+| CU sticky revoke | **0.2.20** per-lease first; process-wide only as last resort |
+| FE CU migration | **0.2.20** silent migrate localStorage CU=1 → host_prefs once |
 
 ## Protocol / product still outside shell-only scope
 
