@@ -6,7 +6,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { PromptAttachmentSummary, Session, SessionBlock } from "../bridge/types";
 
 /** Keep cache JSON small enough to parse quickly (last N blocks). */
-const MAX_CACHED_BLOCKS = 160;
+export const MAX_CACHED_BLOCKS = 160;
 /** Cap tool output / terminal text in cache (chars). */
 const MAX_CACHED_TOOL_TEXT = 8_000;
 /** Cap assistant/thinking text in cache (chars) — full text returns via offline scan. */
@@ -92,11 +92,35 @@ function freezeBlock(block: SessionBlock): SessionBlock {
   return block;
 }
 
+/**
+ * Take the last N blocks but never start mid-turn (0.2.23).
+ * Evidence: slice(-160) began on a tool mid-stream; open painted that window,
+ * then offline merge seamed on a tool content-key and duplicated/reordered tail.
+ */
+export function sliceCacheBlocks(
+  blocks: readonly SessionBlock[],
+  max = MAX_CACHED_BLOCKS,
+): SessionBlock[] {
+  if (blocks.length <= max) return [...blocks];
+  let start = blocks.length - max;
+  // Walk back to the nearest primary user (turn boundary).
+  for (let i = start; i >= 0; i -= 1) {
+    const b = blocks[i];
+    if (b.type === "user" && !b.interjected) {
+      start = i;
+      break;
+    }
+    if (i === 0) start = 0;
+  }
+  // Cap growth if walking back would keep almost everything.
+  if (blocks.length - start > max * 2) {
+    start = blocks.length - max;
+  }
+  return blocks.slice(start);
+}
+
 function compactSession(session: Session): Session {
-  const source =
-    session.blocks.length <= MAX_CACHED_BLOCKS
-      ? session.blocks
-      : session.blocks.slice(-MAX_CACHED_BLOCKS);
+  const source = sliceCacheBlocks(session.blocks, MAX_CACHED_BLOCKS);
   return {
     ...session,
     status: "idle",
@@ -163,3 +187,4 @@ export async function saveSessionCache(session: Session): Promise<void> {
     // Cache is best-effort; never block the UI on disk errors.
   }
 }
+

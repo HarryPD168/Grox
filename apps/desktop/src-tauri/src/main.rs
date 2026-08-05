@@ -5267,10 +5267,19 @@ fn read_ui_transcript_if_fresh(session_dir: &Path, session_id: &str) -> Option<s
     let updates = session_dir.join("updates.jsonl");
     let (size, mtime_ms) = file_size_mtime_ms(&updates)?;
     let src = env.get("source")?;
-    if src.get("updatesSize").and_then(|v| v.as_u64()) != Some(size) {
+    let src_size = src.get("updatesSize").and_then(|v| v.as_u64())?;
+    let src_mtime = src.get("updatesMtimeMs").and_then(|v| v.as_u64())?;
+    // Size must match: content changed. Mtime alone is racy — agent often
+    // appends/locks updates.jsonl after we write the transcript (same second),
+    // which forced open onto the 160-block FE session-cache and caused a 1s
+    // full-rescan flash (evidence: spoof 019fb6ef… size+mtime both drifted
+    // while transcript still held a complete scan).
+    if src_size != size {
         return None;
     }
-    if src.get("updatesMtimeMs").and_then(|v| v.as_u64()) != Some(mtime_ms) {
+    // Allow small mtime drift when size is identical (filesystem touch / lock).
+    let mtime_skew = mtime_ms.abs_diff(src_mtime);
+    if mtime_skew > 60_000 {
         return None;
     }
     env.get("session").cloned()

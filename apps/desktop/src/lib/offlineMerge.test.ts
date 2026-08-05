@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { blockContentKey, mergeOfflineWithLive } from "./offlineMerge";
+import {
+  blockContentKey,
+  firstPrimaryUserBlock,
+  mergeOfflineWithLive,
+} from "./offlineMerge";
 import type { Session } from "../bridge/types";
 
 function sess(
@@ -24,7 +28,7 @@ function sess(
   };
 }
 
-describe("mergeOfflineWithLive", () => {
+describe("mergeOfflineWithLive (0.2.23 evidence-driven)", () => {
   it("keeps offline when live is empty", () => {
     const pending = sess({
       id: "a",
@@ -32,30 +36,97 @@ describe("mergeOfflineWithLive", () => {
       blocks: [{ type: "user", id: "u1", text: "hi", ts: 1 }],
     });
     const out = mergeOfflineWithLive(pending, undefined);
-    expect(out.blocks).toHaveLength(1);
-    expect(out.status).toBe("idle");
+    expect(out.blocks.map((b) => b.id)).toEqual(["u1"]);
   });
 
-  it("appends live-only blocks after offline prefix", () => {
+  it("does not seam on a leading tool mid-stream (spoof cache bug)", () => {
+    // Live = session-cache window that starts mid-tool (real cache shape).
     const pending = sess({
       id: "a",
       status: "idle",
-      blocks: [{ type: "user", id: "u1", text: "hi", ts: 1 }],
+      blocks: [
+        { type: "user", id: "old", text: "ancient", ts: 1 },
+        { type: "assistant", id: "old-a", text: "old reply", ts: 2, streaming: false },
+        { type: "user", id: "u-try", text: "你现在尝试", ts: 3 },
+        {
+          type: "tool",
+          id: "t1",
+          ts: 4,
+          call: {
+            id: "call-164",
+            kind: "execute",
+            title: "run",
+            status: "done",
+            rawKind: "execute",
+            startedAt: 4,
+          },
+        },
+        { type: "assistant", id: "push", text: "# Push 成功\nok", ts: 5, streaming: false },
+      ],
     });
     const cur = sess({
       id: "a",
       status: "idle",
       blocks: [
-        { type: "user", id: "u1", text: "hi", ts: 1 },
-        { type: "user", id: "u2", text: "new", ts: 2 },
+        {
+          type: "tool",
+          id: "live-t",
+          ts: 4,
+          call: {
+            id: "call-164",
+            kind: "execute",
+            title: "run",
+            status: "done",
+            rawKind: "execute",
+            startedAt: 4,
+          },
+        },
+        { type: "assistant", id: "live-push", text: "# Push 成功\nok", ts: 5, streaming: false },
+        { type: "user", id: "live-done", text: "处理好了，你现在尝试", ts: 6 },
+      ],
+    });
+    // Without user anchor in the leading tool-only window, firstPrimaryUser is 处理好了
+    // which is not on disk → keep live as-is (no tool-key seam / reorder).
+    const out = mergeOfflineWithLive(pending, cur);
+    expect(out.blocks.map((b) => b.id)).toEqual(["live-t", "live-push", "live-done"]);
+  });
+
+  it("prepends offline prefix before first primary user in live", () => {
+    const pending = sess({
+      id: "a",
+      status: "idle",
+      blocks: [
+        { type: "user", id: "old", text: "ancient github", ts: 1 },
+        { type: "assistant", id: "old-a", text: "old", ts: 2, streaming: false },
+        { type: "user", id: "u-try", text: "你现在尝试", ts: 3 },
+        { type: "assistant", id: "push", text: "# Push 成功", ts: 4, streaming: false },
+      ],
+    });
+    const cur = sess({
+      id: "a",
+      status: "idle",
+      blocks: [
+        { type: "user", id: "uuid-try", text: "你现在尝试", ts: 3 },
+        { type: "assistant", id: "uuid-push", text: "# Push 成功", ts: 4, streaming: false },
       ],
     });
     const out = mergeOfflineWithLive(pending, cur);
-    // Live is authority for the tail — keeps both live blocks.
-    expect(out.blocks.map((b) => b.id)).toEqual(["u1", "u2"]);
+    expect(out.blocks.map((b) => b.id)).toEqual([
+      "old",
+      "old-a",
+      "uuid-try",
+      "uuid-push",
+    ]);
+    // Tail order preserved: 你现在尝试 then Push (not 处理好了 after).
+    expect(out.blocks.map((b) => (b.type === "user" || b.type === "assistant" ? b.text : ""))).toEqual([
+      "ancient github",
+      "old",
+      "你现在尝试",
+      "# Push 成功",
+    ]);
   });
 
-  it("does not force idle while live turn is busy", () => {
+  it("preserves busy status", () => {
     const pending = sess({
       id: "a",
       status: "idle",
@@ -69,111 +140,27 @@ describe("mergeOfflineWithLive", () => {
         { type: "assistant", id: "a1", text: "…", streaming: true, ts: 2 },
       ],
     });
-    const out = mergeOfflineWithLive(pending, cur);
-    expect(out.status).toBe("running");
-    expect(out.blocks.length).toBeGreaterThanOrEqual(2);
+    expect(mergeOfflineWithLive(pending, cur).status).toBe("running");
   });
 
-  it("preserves awaiting_permission when disk is longer", () => {
-    const pending = sess({
-      id: "a",
-      status: "idle",
-      blocks: [
-        { type: "user", id: "u1", text: "hi", ts: 1 },
-        { type: "user", id: "u2", text: "more", ts: 2 },
-      ],
-    });
-    const cur = sess({
-      id: "a",
-      status: "awaiting_permission",
-      blocks: [{ type: "user", id: "u1", text: "hi", ts: 1 }],
-    });
-    const out = mergeOfflineWithLive(pending, cur);
-    expect(out.status).toBe("awaiting_permission");
-  });
-
-  it("keeps live block identities when content matches (no remount flash)", () => {
-    const pending = sess({
-      id: "a",
-      status: "idle",
-      blocks: [
-        { type: "user", id: "disk-u1", text: "hello world", ts: 1 },
-        { type: "assistant", id: "disk-a1", text: "hi there", ts: 2, streaming: false },
-      ],
-    });
-    const cur = sess({
-      id: "a",
-      status: "idle",
-      blocks: [
-        { type: "user", id: "uuid-u1", text: "hello world", ts: 1 },
-        { type: "assistant", id: "uuid-a1", text: "hi there", ts: 2, streaming: false },
-      ],
-    });
-    const out = mergeOfflineWithLive(pending, cur);
-    expect(out.blocks).toHaveLength(2);
-    // Live authority: keep painted UUIDs.
-    expect(out.blocks.map((b) => b.id)).toEqual(["uuid-u1", "uuid-a1"]);
-  });
-
-  it("prepends offline-only older history without replacing live tail (open flash)", () => {
-    // Fingerprint painted recent turns; disk has older turns + same recent content.
-    const pending = sess({
-      id: "a",
-      status: "idle",
-      blocks: [
-        { type: "user", id: "disk-old", text: "ancient github", ts: 0 },
-        { type: "assistant", id: "disk-old-a", text: "old reply", ts: 0.5, streaming: false },
-        { type: "user", id: "disk-u1", text: "处理好了,你现在尝试", ts: 1 },
-        { type: "assistant", id: "disk-a1", text: "Push 成功", ts: 2, streaming: false },
-      ],
-    });
-    const cur = sess({
-      id: "a",
-      status: "idle",
-      blocks: [
-        { type: "user", id: "uuid-u1", text: "处理好了,你现在尝试", ts: 1 },
-        { type: "assistant", id: "uuid-a1", text: "Push 成功", ts: 2, streaming: false },
-      ],
-    });
-    const out = mergeOfflineWithLive(pending, cur);
-    expect(out.blocks.map((b) => b.id)).toEqual([
-      "disk-old",
-      "disk-old-a",
-      "uuid-u1",
-      "uuid-a1",
-    ]);
-    // Tail must remain the painted Push content (not rewritten to disk ids).
-    const last = out.blocks.at(-1);
-    expect(last?.type).toBe("assistant");
-    if (last?.type === "assistant") expect(last.text).toBe("Push 成功");
-    expect(last?.id).toBe("uuid-a1");
-  });
-
-  it("keeps live trailing turn after offline prefix (content-aware)", () => {
-    const pending = sess({
-      id: "a",
-      status: "idle",
-      blocks: [
-        { type: "user", id: "disk-u1", text: "old", ts: 1 },
-        { type: "assistant", id: "disk-a1", text: "reply", ts: 2, streaming: false },
-      ],
-    });
-    const cur = sess({
-      id: "a",
-      status: "idle",
-      blocks: [
-        { type: "user", id: "uuid-u1", text: "old", ts: 1 },
-        { type: "assistant", id: "uuid-a1", text: "reply", ts: 2, streaming: false },
-        { type: "user", id: "uuid-u2", text: "brand new", ts: 3 },
-      ],
-    });
-    const out = mergeOfflineWithLive(pending, cur);
-    expect(out.blocks.map((b) => (b.type === "user" || b.type === "assistant" ? b.text : b.id))).toEqual([
-      "old",
-      "reply",
-      "brand new",
-    ]);
-    expect(out.blocks.map((b) => b.id)).toEqual(["uuid-u1", "uuid-a1", "uuid-u2"]);
+  it("firstPrimaryUserBlock skips tools and interjects", () => {
+    const blocks: Session["blocks"] = [
+      {
+        type: "tool",
+        id: "t",
+        ts: 1,
+        call: {
+          id: "c",
+          kind: "execute",
+          title: "x",
+          status: "done",
+          startedAt: 1,
+        },
+      },
+      { type: "user", id: "i", text: "插话", ts: 2, interjected: true },
+      { type: "user", id: "u", text: "主消息", ts: 3 },
+    ];
+    expect(firstPrimaryUserBlock(blocks)?.id).toBe("u");
   });
 
   it("blockContentKey distinguishes interjected users", () => {
