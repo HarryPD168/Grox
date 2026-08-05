@@ -6484,6 +6484,10 @@ fn start_offline_session_history(
             }
             // Attach tool outputs from small chat_history.jsonl (safe; not from huge updates).
             enrich_tools_from_chat_history(&dir, &mut blocks);
+            // Evidence (spoof 019fb6ef…): mid_turn_abort users land in chat_history but
+            // never appear as session/update in updates.jsonl. Offline-only scans then
+            // treat those users as live-only and 0.2.22 appended them after Push.
+            enrich_users_from_chat_history(&dir, &mut blocks, updated_at);
             if abandoned() {
                 // Cache may still be useful for this session id, but never finish
                 // global atomics or claim complete for a superseded gen.
@@ -6700,6 +6704,139 @@ fn enrich_tools_from_chat_history(dir: &Path, blocks: &mut [serde_json::Value]) 
                 call.insert("detail".into(), serde_json::Value::String(detail));
             }
         }
+    }
+}
+
+/// Insert user turns present in chat_history.jsonl but missing from the updates.jsonl
+/// scan, preserving chat_history order relative to known users.
+///
+/// Evidence (019fb6ef…): chat_history has
+///   user "处理好了，你现在尝试" then user "你现在尝试" then assistant "Push 成功"
+/// while updates.jsonl only records "你现在尝试". Without this, offline blocks lack
+/// the first user; FE merge treated it as live-only and appended it after Push.
+fn enrich_users_from_chat_history(
+    dir: &Path,
+    blocks: &mut Vec<serde_json::Value>,
+    updated_at: u64,
+) {
+    let chat_path = dir.join("chat_history.jsonl");
+    let Ok(raw) = read_bounded_text(&chat_path, 8 * 1024 * 1024) else {
+        return;
+    };
+    if raw.trim().is_empty() {
+        return;
+    }
+
+    // Ordered unique user texts from chat_history (first occurrence wins).
+    let mut chat_users: Vec<String> = Vec::new();
+    let mut seen_chat: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if entry.get("type").and_then(|v| v.as_str()) != Some("user") {
+            continue;
+        }
+        let text = extract_user_visible_text(&json_text_content(
+            entry.get("content").unwrap_or(&serde_json::Value::Null),
+        ));
+        let text = text.trim().to_string();
+        if text.is_empty() || !seen_chat.insert(text.clone()) {
+            continue;
+        }
+        chat_users.push(text);
+    }
+    if chat_users.is_empty() {
+        return;
+    }
+
+    // Map user text → first block index in the offline scan.
+    let mut offline_user_idx: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for (i, block) in blocks.iter().enumerate() {
+        if block.get("type").and_then(|t| t.as_str()) != Some("user") {
+            continue;
+        }
+        let Some(text) = block.get("text").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let key = text.trim().to_string();
+        if key.is_empty() {
+            continue;
+        }
+        offline_user_idx.entry(key).or_insert(i);
+    }
+
+    // Missing users in chat order, with insert-before target (next present user text).
+    let mut missing: Vec<(String, Option<String>)> = Vec::new();
+    for (i, text) in chat_users.iter().enumerate() {
+        if offline_user_idx.contains_key(text) {
+            continue;
+        }
+        let mut next_present: Option<String> = None;
+        for later in chat_users.iter().skip(i + 1) {
+            if offline_user_idx.contains_key(later) {
+                next_present = Some(later.clone());
+                break;
+            }
+        }
+        missing.push((text.clone(), next_present));
+    }
+    if missing.is_empty() {
+        return;
+    }
+
+    // Insert from back to front so earlier indices stay valid for later inserts
+    // that target later "next_present" positions. Group by insert index.
+    // Build final list: walk chat order, emit missing then present offline turns.
+    // Simpler approach: for each missing, find insert index and insert; process
+    // in reverse chat order so indices of later anchors remain stable.
+    for (text, next_present) in missing.into_iter().rev() {
+        // Recompute index map after previous inserts.
+        offline_user_idx.clear();
+        for (i, block) in blocks.iter().enumerate() {
+            if block.get("type").and_then(|t| t.as_str()) != Some("user") {
+                continue;
+            }
+            if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
+                let key = t.trim().to_string();
+                if !key.is_empty() {
+                    offline_user_idx.entry(key).or_insert(i);
+                }
+            }
+        }
+        if offline_user_idx.contains_key(&text) {
+            continue;
+        }
+        let insert_at = if let Some(next) = next_present.as_ref() {
+            offline_user_idx.get(next).copied().unwrap_or(blocks.len())
+        } else {
+            // No later known user — place after the last offline user, else end.
+            blocks
+                .iter()
+                .rposition(|b| b.get("type").and_then(|t| t.as_str()) == Some("user"))
+                .map(|i| i + 1)
+                .unwrap_or(blocks.len())
+        };
+        // Stable-ish id from content hash (matches offline id style loosely).
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in text.bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        let id = format!("off-user-chat-{:016x}", h);
+        let block = serde_json::json!({
+            "type": "user",
+            "id": id,
+            "text": text,
+            "ts": updated_at,
+        });
+        let at = insert_at.min(blocks.len());
+        blocks.insert(at, block);
     }
 }
 

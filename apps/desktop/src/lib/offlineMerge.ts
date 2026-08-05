@@ -39,16 +39,92 @@ export function firstPrimaryUserBlock(
 }
 
 /**
+ * Reuse live block objects when content keys match offline (stable React keys).
+ */
+export function stabilizeOfflineBlocksWithLive(
+  offlineBlocks: readonly SessionBlock[],
+  liveBlocks: readonly SessionBlock[],
+): SessionBlock[] {
+  if (liveBlocks.length === 0) return [...offlineBlocks];
+  const liveByKey = new Map<string, SessionBlock>();
+  for (const b of liveBlocks) {
+    const k = blockContentKey(b);
+    if (!liveByKey.has(k)) liveByKey.set(k, b);
+  }
+  return offlineBlocks.map((b) => liveByKey.get(blockContentKey(b)) ?? b);
+}
+
+/**
+ * Insert live-only blocks into an offline spine.
+ *
+ * For each live-only block, place it immediately before the next live block
+ * whose content key exists in offline (shared anchor). If no later shared
+ * anchor exists, append.
+ *
+ * Evidence (019fb6ef…, 0.2.22): "处理好了，你现在尝试" was live-only relative to
+ * updates.jsonl and was appended after Push. Correct placement is before the
+ * next shared user "你现在尝试".
+ */
+export function insertLiveOnlyIntoOffline(
+  offlineBlocks: readonly SessionBlock[],
+  liveBlocks: readonly SessionBlock[],
+): SessionBlock[] {
+  const offlineKeys = new Set(offlineBlocks.map(blockContentKey));
+  const liveOnly = liveBlocks.filter((b) => !offlineKeys.has(blockContentKey(b)));
+  if (liveOnly.length === 0) {
+    return stabilizeOfflineBlocksWithLive(offlineBlocks, liveBlocks);
+  }
+
+  const result = stabilizeOfflineBlocksWithLive(offlineBlocks, liveBlocks);
+  const keyIndex = () => {
+    const map = new Map<string, number>();
+    for (let i = 0; i < result.length; i += 1) {
+      const k = blockContentKey(result[i]);
+      if (!map.has(k)) map.set(k, i);
+    }
+    return map;
+  };
+
+  // Insert in live order so relative order among live-only clusters is preserved.
+  // Process front-to-back; when multiple insert at the same anchor, later ones
+  // shift after earlier inserts at that index.
+  for (let li = 0; li < liveBlocks.length; li += 1) {
+    const block = liveBlocks[li];
+    const key = blockContentKey(block);
+    if (offlineKeys.has(key)) continue;
+    // Already inserted (duplicate live-only)?
+    if (result.some((b) => blockContentKey(b) === key)) continue;
+
+    let insertAt = result.length;
+    for (let j = li + 1; j < liveBlocks.length; j += 1) {
+      const nextKey = blockContentKey(liveBlocks[j]);
+      if (!offlineKeys.has(nextKey)) continue;
+      const idx = keyIndex().get(nextKey);
+      if (idx !== undefined) {
+        insertAt = idx;
+        break;
+      }
+    }
+    result.splice(insertAt, 0, block);
+  }
+  return result;
+}
+
+/**
  * Merge offline disk history with any live-only blocks still on the session.
  *
- * Evidence (spoof 019fb6ef…, 0.2.22 install):
- * - get_ui_transcript fingerprint missed (mtime/size race) → open painted
- *   session-cache starting on a **tool** mid-stream.
- * - merge used firstLiveKey = that tool → wrong seam, duplicated tail, user
- *   bubble "处理好了…" appeared after Push (wrong relative order in paint).
+ * Evidence (spoof 019fb6ef…, installed 0.2.22):
+ * 1. get_ui_transcript fingerprint MISS (updates size 339281386 vs 339282532)
+ * 2. open painted chat_history preview (correct: 处理好了 → 你现在尝试 → Push)
+ * 3. offline scan from updates lacked "处理好了" entirely
+ * 4. merge treated it as trailing live-only → appended AFTER Push (~1s flash)
+ * 5. corrupt order written to session-cache (i100 你现在尝试, i131 Push, i132 处理好了)
  *
- * Rule: seam on the **first primary user** in live, never on a tool.
- * Live tail is visual authority; offline only contributes a pure prefix.
+ * Rules (0.2.24):
+ * - Idle: offline is chronological spine; stabilize identities from live;
+ *   insert live-only before the next shared live→offline anchor (never blind append).
+ * - Busy: keep live as-is (scan deferred via pendingOfflineMerge).
+ * - Empty live: take offline.
  */
 export function mergeOfflineWithLive(pending: Session, cur: Session | undefined): Session {
   const busyStatus = cur && isLiveBusyStatus(cur.status) ? cur.status : null;
@@ -58,58 +134,34 @@ export function mergeOfflineWithLive(pending: Session, cur: Session | undefined)
     return { ...pending, status };
   }
 
-  const pendingKeys = new Set(pending.blocks.map(blockContentKey));
-  const liveOnly = cur.blocks.filter((b) => !pendingKeys.has(blockContentKey(b)));
-
-  // Seam on first primary user in the painted (live) window.
-  const anchor = firstPrimaryUserBlock(cur.blocks);
-  if (anchor && !busyStatus) {
-    const anchorKey = blockContentKey(anchor);
-    const seam = pending.blocks.findIndex((b) => blockContentKey(b) === anchorKey);
-    if (seam > 0) {
-      const prefix = pending.blocks.slice(0, seam);
-      return {
-        ...pending,
-        status: "idle",
-        blocks: [...prefix, ...cur.blocks],
-        usage: cur.usage?.outputTokens ? cur.usage : pending.usage,
-      };
-    }
-    if (seam === 0) {
-      // Live window starts at the same user as offline — keep live tail.
-      // Offline-only blocks that appear before any later live key are rare;
-      // live is authority for the open paint.
-      if (liveOnly.length === 0) {
-        return {
-          ...cur,
-          status: "idle",
-          usage: cur.usage?.outputTokens ? cur.usage : pending.usage,
-        };
-      }
-      return {
-        ...cur,
-        status: "idle",
-        blocks: [...cur.blocks], // liveOnly already inside cur
-        usage: cur.usage?.outputTokens ? cur.usage : pending.usage,
-      };
-    }
-    // Anchor user not found on disk: keep live (don't replace with unrelated offline).
-    if (seam < 0) {
-      return { ...cur, status: "idle" };
-    }
-  }
-
-  // Busy: keep status; prefer live blocks + any offline-only trailing is not applied
-  // (scan waits until idle via pendingOfflineMerge).
+  // Busy turn: do not rewrite history under the operator.
   if (busyStatus) {
     return {
       ...cur,
       status: busyStatus,
-      blocks: liveOnly.length === 0 ? cur.blocks : cur.blocks,
       usage: cur.usage?.outputTokens ? cur.usage : pending.usage,
     };
   }
 
-  // No primary user in live (orphan tools only) — keep live to avoid tool-key seam.
-  return { ...cur, status: "idle" };
+  // Idle: offline spine + smart live-only insert.
+  // If offline is empty/tiny and live is the only paint, keep live.
+  if (pending.blocks.length === 0) {
+    return { ...cur, status: "idle" };
+  }
+
+  // When offline has no overlapping content with live at all and is shorter,
+  // live is likely a fresher paint (e.g. brand-new turn) — keep live.
+  const pendingKeys = new Set(pending.blocks.map(blockContentKey));
+  const overlap = cur.blocks.some((b) => pendingKeys.has(blockContentKey(b)));
+  if (!overlap && cur.blocks.length >= pending.blocks.length) {
+    return { ...cur, status: "idle" };
+  }
+
+  const blocks = insertLiveOnlyIntoOffline(pending.blocks, cur.blocks);
+  return {
+    ...pending,
+    status: "idle",
+    blocks,
+    usage: cur.usage?.outputTokens ? cur.usage : pending.usage,
+  };
 }
