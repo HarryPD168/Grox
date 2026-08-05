@@ -2390,10 +2390,17 @@ export const useDesktop = create<DesktopState>((set, get) => {
                     return;
                   }
                   const merged = mergeOfflineWithLive(next, cur);
-                  set({
-                    sessions: { ...get().sessions, [payload.id]: merged },
-                  });
-                  if (merged.blocks.length > 0) scheduleSaveSessionCache(merged);
+                  // Skip no-op identity rewrites (same ids) to avoid Timeline thrash.
+                  const sameIds =
+                    cur &&
+                    cur.blocks.length === merged.blocks.length &&
+                    cur.blocks.every((b, i) => b.id === merged.blocks[i]?.id);
+                  if (!sameIds) {
+                    set({
+                      sessions: { ...get().sessions, [payload.id]: merged },
+                    });
+                    if (merged.blocks.length > 0) scheduleSaveSessionCache(merged);
+                  }
                   if (phaseComplete) {
                     offlineHistoryComplete.add(payload.id);
                     if (upgradeForceOfflineRescan) upgradeForceOfflineRescan = false;

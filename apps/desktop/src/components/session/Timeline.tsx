@@ -483,9 +483,12 @@ export function Timeline({ session }: { session: Session }) {
   const followRef = useRef(true);
   /** True while we programmatically pin scroll — ignore onScroll unfollow (0.2.20). */
   const pinningRef = useRef(false);
+  /** Until this timestamp, refuse unfollow (offline enrich reflow window). */
+  const suppressUnfollowUntilRef = useRef(0);
   const jumpTimersRef = useRef<number[]>([]);
-  /** Last session id we forced open-pin for (idle enrich must not re-open pin). */
-  const openPinnedSessionRef = useRef<string | null>(null);
+  const prevSessionIdRef = useRef<string | null>(null);
+  const prevBlocksLenRef = useRef(0);
+  const prevScrollHeightRef = useRef(0);
   const turns = useMemo(() => groupTurns(session.blocks), [session.blocks]);
   /** true = show entire transcript (default for restored history). */
   const [showAll, setShowAll] = useState(true);
@@ -552,6 +555,8 @@ export function Timeline({ session }: { session: Session }) {
   }, [language, turns]);
 
   const markUserUnfollow = useCallback(() => {
+    if (pinningRef.current) return;
+    if (Date.now() < suppressUnfollowUntilRef.current) return;
     if (!followRef.current) {
       // Already free — still ensure chrome is visible after first leave-bottom.
       setShowJumpLatest((v) => (v ? v : true));
@@ -566,27 +571,46 @@ export function Timeline({ session }: { session: Session }) {
     setShowJumpLatest(false);
   }, []);
 
-  const scrollToBottom = useCallback((force = false) => {
-    if (!force && !followRef.current) return false;
+  /** Pin bottom and hold suppress window so enrich reflow cannot unfollow. */
+  const pinBottomHard = useCallback((suppressMs = 400) => {
     const el = scrollerRef.current;
     if (!el) return false;
+    followRef.current = true;
+    setShowJumpLatest(false);
     pinningRef.current = true;
+    suppressUnfollowUntilRef.current = Math.max(
+      suppressUnfollowUntilRef.current,
+      Date.now() + suppressMs,
+    );
     el.scrollTop = el.scrollHeight;
-    // Clear after layout/scroll events from this pin have settled.
-    window.requestAnimationFrame(() => {
-      window.requestAnimationFrame(() => {
+    window.setTimeout(() => {
+      // Re-apply after late layout (folds/markdown) then release pin flag.
+      const node = scrollerRef.current;
+      if (node && followRef.current) {
+        node.scrollTop = node.scrollHeight;
+      }
+      if (Date.now() >= suppressUnfollowUntilRef.current - 50) {
         pinningRef.current = false;
-      });
-    });
+      }
+    }, Math.min(suppressMs, 320));
     return true;
   }, []);
+
+  const scrollToBottom = useCallback((force = false) => {
+    if (!force && !followRef.current) return false;
+    return pinBottomHard(force ? 500 : 200);
+  }, [pinBottomHard]);
 
   // Opening / switching: always show full history (scroll sticks to bottom).
   useEffect(() => {
     setShowAll(true);
     followRef.current = true;
     setShowJumpLatest(false);
-    openPinnedSessionRef.current = session.id;
+    prevSessionIdRef.current = session.id;
+    prevBlocksLenRef.current = 0;
+    prevScrollHeightRef.current = 0;
+    // Long suppress: offline scan often lands 0.5–2s after open.
+    suppressUnfollowUntilRef.current = Date.now() + 2_000;
   }, [session.id]);
 
   // Offline scan / cache upgrade may add many older turns — keep them visible.
@@ -652,36 +676,79 @@ export function Timeline({ session }: { session: Session }) {
     jumpTimersRef.current.push(window.setTimeout(run, 160));
   };
 
-  // Pin to bottom while follow is on.
-  // Live turns: pin on every stream stickKey (existing).
-  // Idle history enrich (offline scan ~1s after open): pin only if still following,
-  // with pinningRef so onScroll does not falsely unfollow mid-reflow (0.2.20).
+  // Pin / preserve viewport when blocks change.
+  // Critical bug (open flash): offline scan ~1s after open *prepends* history.
+  // scrollTop stays put → viewport lands mid-transcript → onScroll unfollows →
+  // "回到最新". Fix: detect length growth on idle, force follow+bottom with
+  // long suppress; compensate height delta if user had unfollowed intentionally.
   useLayoutEffect(() => {
-    if (!hasBlocks) return;
-    if (!followRef.current) return;
-    if (!isLive && openPinnedSessionRef.current === session.id) {
-      // Same session idle enrich — stay at bottom if user has not left.
-      scrollToBottom(true);
+    const el = scrollerRef.current;
+    if (!el || !hasBlocks) return;
+
+    const prevId = prevSessionIdRef.current;
+    const prevLen = prevBlocksLenRef.current;
+    const prevH = prevScrollHeightRef.current;
+    const len = session.blocks.length;
+    const sessionChanged = prevId !== session.id;
+    const grew = !sessionChanged && len > prevLen;
+
+    prevSessionIdRef.current = session.id;
+    prevBlocksLenRef.current = len;
+
+    if (sessionChanged) {
+      pinBottomHard(2_000);
+      prevScrollHeightRef.current = el.scrollHeight;
       return;
     }
-    scrollToBottom(true);
-  }, [session.id, stickKey, visibleTurns.length, hasBlocks, scrollToBottom, isLive]);
 
-  // Session open: force follow + bottom after late layout (images/fonts).
+    if (isLive) {
+      if (followRef.current) pinBottomHard(200);
+      prevScrollHeightRef.current = el.scrollHeight;
+      return;
+    }
+
+    // Idle: offline enrich / upgrade rescan.
+    if (grew) {
+      const newH = el.scrollHeight;
+      const delta = newH - (prevH || 0);
+      // Open-window enrich: always re-stick to bottom (user did not scroll away
+      // to "read history" within suppress window after open).
+      const inOpenGrace = Date.now() < suppressUnfollowUntilRef.current;
+      if (followRef.current || inOpenGrace || prevLen === 0) {
+        pinBottomHard(1_500);
+      } else if (delta > 0) {
+        // User was reading history: keep visual anchor when content prepends.
+        pinningRef.current = true;
+        el.scrollTop += delta;
+        window.requestAnimationFrame(() => {
+          pinningRef.current = false;
+        });
+      }
+      prevScrollHeightRef.current = el.scrollHeight;
+      return;
+    }
+
+    if (followRef.current) {
+      pinBottomHard(200);
+    }
+    prevScrollHeightRef.current = el.scrollHeight;
+  }, [session.id, stickKey, visibleTurns.length, hasBlocks, isLive, pinBottomHard, session.blocks.length]);
+
+  // Session open: force follow + bottom after late layout (images/fonts/offline).
   useEffect(() => {
     clearJumpTimers();
     if (!hasBlocks) return;
     markFollowLatest();
-    scrollToBottom(true);
-    const t1 = window.setTimeout(() => {
-      if (followRef.current) scrollToBottom(true);
-    }, 40);
-    const t2 = window.setTimeout(() => {
-      if (followRef.current) scrollToBottom(true);
-    }, 200);
+    pinBottomHard(2_000);
+    const timers = [40, 200, 600, 1200, 2000].map((ms) =>
+      window.setTimeout(() => {
+        if (followRef.current || Date.now() < suppressUnfollowUntilRef.current) {
+          pinBottomHard(400);
+        }
+      }, ms),
+    );
     return () => {
-      window.clearTimeout(t1);
-      window.clearTimeout(t2);
+      for (const t of timers) window.clearTimeout(t);
       clearJumpTimers();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: session open only
@@ -689,6 +756,7 @@ export function Timeline({ session }: { session: Session }) {
 
   const onScrollerScroll = useCallback(() => {
     if (pinningRef.current) return;
+    if (Date.now() < suppressUnfollowUntilRef.current) return;
     const el = scrollerRef.current;
     if (!el) return;
     const dist = el.scrollHeight - el.scrollTop - el.clientHeight;
@@ -775,7 +843,9 @@ export function Timeline({ session }: { session: Session }) {
       <div
         key={session.id}
         ref={scrollerRef}
-        className="h-full min-w-0 flex-1 overflow-y-auto overflow-x-hidden outline-none"
+        // overflow-anchor:none — browser scroll anchoring fights offline prepend
+        // and was leaving the viewport mid-history after open enrich (0.2.20/21).
+        className="h-full min-w-0 flex-1 overflow-y-auto overflow-x-hidden outline-none [overflow-anchor:none]"
         // CSS scroll anchoring can fight intentional follow pin; we manage pin ourselves.
         style={{ overflowAnchor: "none" }}
         tabIndex={0}
