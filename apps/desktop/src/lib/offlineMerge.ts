@@ -35,9 +35,7 @@ export function blockContentKey(block: SessionBlock): string {
 }
 
 /**
- * Reuse live block objects when content keys match offline (0.2.20).
- * Keeps React keys / turn grouping stable so late disk scan does not remount
- * the whole timeline and flash the viewport mid-history.
+ * Reuse live block objects when content keys match offline.
  */
 export function stabilizeOfflineBlocksWithLive(
   offlineBlocks: readonly SessionBlock[],
@@ -54,12 +52,14 @@ export function stabilizeOfflineBlocksWithLive(
 
 /**
  * Merge offline disk history with any live-only blocks still on the session.
- * Preserves busy turn status so a late disk scan cannot unlock send mid-turn.
  *
- * When idle, offline is preferred as the authority if it is at least as rich
- * (by content keys). Matching content **reuses live block identities** so open
- * paint does not thrash 1s later (0.2.20). Live-only streaming / optimistic
- * bubbles are appended when their content is not already present on disk.
+ * 0.2.22 open-flash fix:
+ * UI fingerprint paint is the **visual authority** for the open session.
+ * Offline scan must only **prepend** older history that is not already in live,
+ * never replace the live tail (that rewrote turn ids / dropped latest content
+ * and yanked the scroller mid-history ~1s after open).
+ *
+ * Busy status is preserved so a late disk scan cannot unlock send mid-turn.
  */
 export function mergeOfflineWithLive(pending: Session, cur: Session | undefined): Session {
   const busyStatus = cur && isLiveBusyStatus(cur.status) ? cur.status : null;
@@ -69,45 +69,83 @@ export function mergeOfflineWithLive(pending: Session, cur: Session | undefined)
     return { ...pending, status };
   }
 
+  const liveKeys = cur.blocks.map(blockContentKey);
+  const liveKeySet = new Set(liveKeys);
   const pendingKeys = new Set(pending.blocks.map(blockContentKey));
   const liveOnly = cur.blocks.filter((b) => !pendingKeys.has(blockContentKey(b)));
-  const stabilized = stabilizeOfflineBlocksWithLive(pending.blocks, cur.blocks);
 
-  // Idle + offline covers live content → offline structure, live identities.
-  if (!busyStatus && liveOnly.length === 0) {
-    return {
-      ...pending,
-      status: "idle",
-      blocks: stabilized,
-      usage: cur.usage?.outputTokens ? cur.usage : pending.usage,
-    };
-  }
+  // --- Prefer live tail: prepend offline-only prefix before first live overlap ---
+  // UI open paint is almost always a *suffix* of full disk history (fingerprint /
+  // cache). Replacing the whole array with disk caused the 1s "content switch".
+  if (!busyStatus && liveKeys.length > 0) {
+    const firstLiveKey = liveKeys[0]!;
+    const firstOverlap = pending.blocks.findIndex((b) => blockContentKey(b) === firstLiveKey);
 
-  // Idle + offline longer/equal and covers live → stabilize + residual liveOnly.
-  if (!busyStatus && pending.blocks.length >= cur.blocks.length && liveOnly.length === 0) {
-    return {
-      ...pending,
-      status: "idle",
-      blocks: stabilized,
-      usage: cur.usage?.outputTokens ? cur.usage : pending.usage,
-    };
-  }
-
-  // Live strictly longer by raw length AND no content overlap path for residuals:
-  // keep live when offline is a short cache prefix of the same session (legacy).
-  if (cur.blocks.length > pending.blocks.length && liveOnly.length === cur.blocks.length) {
-    if (!busyStatus && pending.blocks.length >= Math.floor(cur.blocks.length * 0.5)) {
-      const trailing = pickTrailingLiveOnly(cur.blocks, pendingKeys);
+    if (firstOverlap > 0) {
+      // Offline has older blocks before what the UI already shows.
+      const prefix = pending.blocks.slice(0, firstOverlap);
+      // Keep every live block object (stable React keys / latest content).
       return {
         ...pending,
         status: "idle",
-        blocks: trailing.length > 0 ? [...stabilized, ...trailing] : stabilized,
+        blocks: [...prefix, ...cur.blocks],
         usage: cur.usage?.outputTokens ? cur.usage : pending.usage,
       };
     }
-    return { ...cur, status };
+
+    if (firstOverlap === 0) {
+      // Same start key: keep live tail entirely; only add offline blocks whose
+      // content is not already in live (older gaps are rare when overlap is 0).
+      const offlineOnly = pending.blocks.filter((b) => !liveKeySet.has(blockContentKey(b)));
+      if (offlineOnly.length === 0 && liveOnly.length === 0) {
+        // Disk equals painted content — keep live identities (no remount).
+        return {
+          ...cur,
+          status: "idle",
+          usage: cur.usage?.outputTokens ? cur.usage : pending.usage,
+        };
+      }
+      if (offlineOnly.length === 0) {
+        // Live has extra trailing (e.g. just-sent); keep live as-is.
+        return { ...cur, status: "idle" };
+      }
+      // Offline-only blocks exist but first keys match — treat offline-only as
+      // prefix material only when they all appear before any live key in pending.
+      const firstLiveInPending = pending.blocks.findIndex((b) => liveKeySet.has(blockContentKey(b)));
+      const purePrefix =
+        firstLiveInPending > 0
+          ? pending.blocks.slice(0, firstLiveInPending).filter((b) => !liveKeySet.has(blockContentKey(b)))
+          : [];
+      if (purePrefix.length > 0) {
+        return {
+          ...pending,
+          status: "idle",
+          blocks: [...purePrefix, ...cur.blocks],
+          usage: cur.usage?.outputTokens ? cur.usage : pending.usage,
+        };
+      }
+      // Fall through to stabilize path for odd interleaves.
+    }
+
+    if (firstOverlap < 0) {
+      // No content overlap (total ID/content mismatch). Prefer longer offline
+      // with trailing live-only when offline is substantial; else keep live.
+      if (pending.blocks.length >= Math.floor(cur.blocks.length * 0.5)) {
+        const trailing = pickTrailingLiveOnly(cur.blocks, pendingKeys);
+        const stabilized = stabilizeOfflineBlocksWithLive(pending.blocks, cur.blocks);
+        return {
+          ...pending,
+          status: "idle",
+          blocks: trailing.length > 0 ? [...stabilized, ...trailing] : stabilized,
+          usage: cur.usage?.outputTokens ? cur.usage : pending.usage,
+        };
+      }
+      return { ...cur, status: "idle" };
+    }
   }
 
+  // Busy turn: stabilize offline + append live-only, keep busy status.
+  const stabilized = stabilizeOfflineBlocksWithLive(pending.blocks, cur.blocks);
   if (liveOnly.length === 0) {
     return {
       ...pending,
@@ -116,7 +154,6 @@ export function mergeOfflineWithLive(pending: Session, cur: Session | undefined)
       usage: cur.usage?.outputTokens ? cur.usage : pending.usage,
     };
   }
-
   return {
     ...pending,
     status,
@@ -127,14 +164,12 @@ export function mergeOfflineWithLive(pending: Session, cur: Session | undefined)
 
 /**
  * When offline and live share almost no content keys (UUID vs disk ids),
- * only keep a short trailing live suffix that looks like the current turn
- * (last user + following blocks), not the entire live transcript.
+ * only keep a short trailing live suffix that looks like the current turn.
  */
 function pickTrailingLiveOnly(
   liveBlocks: SessionBlock[],
   pendingKeys: Set<string>,
 ): SessionBlock[] {
-  // Walk from end: collect from last unmatched user through end.
   let start = -1;
   for (let i = liveBlocks.length - 1; i >= 0; i -= 1) {
     const b = liveBlocks[i];
@@ -144,7 +179,6 @@ function pickTrailingLiveOnly(
     }
   }
   if (start < 0) {
-    // No new user — keep last unmatched assistant/tool burst (max 12).
     const tail: SessionBlock[] = [];
     for (let i = liveBlocks.length - 1; i >= 0 && tail.length < 12; i -= 1) {
       const b = liveBlocks[i];
