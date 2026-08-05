@@ -55,6 +55,40 @@ describe("shouldForceOfflineRescan (0.2.30 per-session)", () => {
       }),
     ).toBe(false);
   });
+
+  it("multi-open: each session forced once; not process-wide forever (0.2.30)", () => {
+    // Mirrors store upgradeForceRescanned + markOfflineHistoryComplete.
+    const upgradeActive = true;
+    const rescanned = new Set<string>();
+    const force = (id: string) =>
+      shouldForceOfflineRescan({
+        upgradeRescanActive: upgradeActive,
+        sessionAlreadyForceRescanned: rescanned.has(id),
+      });
+    const markDone = (id: string) => {
+      if (upgradeActive) rescanned.add(id);
+    };
+
+    expect(force("sess-a")).toBe(true);
+    markDone("sess-a");
+    // A already done; B still needs force; re-open A must not force again.
+    expect(force("sess-a")).toBe(false);
+    expect(force("sess-b")).toBe(true);
+    markDone("sess-b");
+    expect(force("sess-b")).toBe(false);
+    expect(force("sess-c")).toBe(true);
+  });
+
+  it("ignores deprecated alreadyComplete when session not yet force-rescanned", () => {
+    // 0.2.29 process-wide used alreadyComplete; 0.2.30 ignores it.
+    expect(
+      shouldForceOfflineRescan({
+        upgradeRescanActive: true,
+        sessionAlreadyForceRescanned: false,
+        alreadyComplete: true,
+      }),
+    ).toBe(true);
+  });
 });
 
 describe("sanitizeSessionForOpen", () => {

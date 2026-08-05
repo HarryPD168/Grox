@@ -8491,6 +8491,21 @@ fn acp_set_silent_stream(
 /// (e.g. `_x.ai/yolo_mode_changed` when switching missions / permission mode).
 /// That leading underscore must be allowed or every window switch floods errors.
 fn acp_method_allowed(method: &str) -> bool {
+    // Fail closed on empty / traversal / control chars (XSS → stdin).
+    if method.is_empty()
+        || method.contains("..")
+        || method.contains('\\')
+        || method.bytes().any(|b| b < 0x20 || b == 0x7f)
+    {
+        return false;
+    }
+    // Method names are path-like: alnum, `/`, `_`, `.`, `-` only.
+    if !method
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'_' | b'.' | b'-'))
+    {
+        return false;
+    }
     // Normalize extension notify form: `_x.ai/foo` → treat like `x.ai/foo`.
     let m = method.strip_prefix('_').unwrap_or(method);
     matches!(
@@ -10167,6 +10182,54 @@ base_url = "https://ok.example"
     }
 
     #[test]
+    fn trim_offline_blocks_skips_interjected_user_boundary() {
+        // Primary user, tools, interject, more tools — walk-back must not stop on interject.
+        let mut blocks = vec![
+            serde_json::json!({"type": "user", "id": "u0", "text": "main"}),
+            serde_json::json!({"type": "tool", "id": "t1", "call": {"id": "c1"}}),
+            serde_json::json!({"type": "tool", "id": "t2", "call": {"id": "c2"}}),
+            serde_json::json!({"type": "user", "id": "inj", "text": "插话", "interjected": true}),
+            serde_json::json!({"type": "tool", "id": "t3", "call": {"id": "c3"}}),
+            serde_json::json!({"type": "tool", "id": "t4", "call": {"id": "c4"}}),
+            serde_json::json!({"type": "tool", "id": "t5", "call": {"id": "c5"}}),
+            serde_json::json!({"type": "tool", "id": "t6", "call": {"id": "c6"}}),
+            serde_json::json!({"type": "tool", "id": "t7", "call": {"id": "c7"}}),
+            serde_json::json!({"type": "tool", "id": "t8", "call": {"id": "c8"}}),
+        ];
+        trim_offline_blocks_at_user_boundary(&mut blocks, 6);
+        assert_eq!(blocks[0].get("type").and_then(|t| t.as_str()), Some("user"));
+        assert_eq!(blocks[0].get("id").and_then(|t| t.as_str()), Some("u0"));
+        assert_ne!(
+            blocks[0]
+                .get("interjected")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            true
+        );
+    }
+
+    #[test]
+    fn trim_offline_blocks_noop_when_under_max() {
+        let mut blocks = vec![
+            serde_json::json!({"type": "user", "id": "u", "text": "hi"}),
+            serde_json::json!({"type": "assistant", "id": "a", "text": "ok"}),
+        ];
+        let before = blocks.len();
+        trim_offline_blocks_at_user_boundary(&mut blocks, 1500);
+        assert_eq!(blocks.len(), before);
+    }
+
+    #[test]
+    fn acp_method_rejects_shell_and_eval_even_with_underscore() {
+        assert!(!acp_method_allowed("_shell/exec"));
+        assert!(!acp_method_allowed("_eval"));
+        assert!(!acp_method_allowed("session/../../evil"));
+        // Prefix allow: x.ai/* and session/* after single underscore strip only.
+        assert!(acp_method_allowed("_x.ai/custom_notify"));
+        assert!(acp_method_allowed("session/custom_ext"));
+    }
+
+    #[test]
     fn inject_computer_mcp_auth_strips_fe_headers_without_live_server() {
         let mut params = serde_json::json!({
             "mcpServers": [{
@@ -10178,11 +10241,37 @@ base_url = "https://ok.example"
         });
         inject_computer_mcp_auth_into_params(&mut params);
         let server = &params["mcpServers"][0];
-        // Without a live host endpoint, FE Authorization must still be stripped.
-        assert!(server.get("headers").is_none() || server["headers"].as_array().map(|a| a.is_empty()).unwrap_or(true));
+        // Security invariant: FE-planted Bearer never survives (even if another
+        // test left a process-wide live MCP server that host re-injects).
         let raw = server.to_string();
         assert!(!raw.contains("fe-planted-token"));
         assert!(!raw.contains("Bearer fe"));
+        match computer_mcp::live_mcp_endpoint() {
+            None => {
+                // No live host endpoint: headers must be fully stripped.
+                assert!(
+                    server.get("headers").is_none()
+                        || server["headers"]
+                            .as_array()
+                            .map(|a| a.is_empty())
+                            .unwrap_or(true)
+                );
+            }
+            Some(ep) => {
+                // Live server: host may inject its own Bearer (not FE's).
+                let headers = server["headers"].as_array().expect("host headers");
+                let auth = headers
+                    .iter()
+                    .find(|h| h.get("name").and_then(|n| n.as_str()) == Some("Authorization"))
+                    .and_then(|h| h.get("value").and_then(|v| v.as_str()))
+                    .unwrap_or("");
+                assert_eq!(auth, format!("Bearer {}", ep.token));
+                assert_eq!(
+                    server.get("url").and_then(|u| u.as_str()),
+                    Some(ep.url.as_str())
+                );
+            }
+        }
     }
 
     #[test]
