@@ -4889,15 +4889,14 @@ fn computer_session_extensions(operator_enabled: Option<bool>) -> Result<Compute
             });
         }
     };
+    // 0.2.29: never put Bearer into the WebView IPC result. FE only needs a
+    // non-empty mcpServers + leaseId; acp_send injects Authorization on wire.
+    let _token_kept_host_only = endpoint.token;
     Ok(ComputerSessionExtensions {
         mcp_servers: vec![serde_json::json!({
             "type": "http",
             "name": "grok_desktop_computer",
             "url": endpoint.url,
-            "headers": [{
-                "name": "Authorization",
-                "value": format!("Bearer {}", endpoint.token)
-            }]
         })],
         plugin_dirs: vec![path_for_webview(&plugin)],
         lease_id,
@@ -8531,14 +8530,27 @@ async fn acp_send(
             MAX_ACP_LINE_BYTES
         ));
     }
-    // Method allowlist — reject unknown JSON-RPC methods from WebView.
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
-        if let Some(method) = v.get("method").and_then(|m| m.as_str()) {
-            if !acp_method_allowed(method) {
-                return Err(format!("不允许的 ACP 方法：{method}"));
+    // Method allowlist + host-side Computer Use auth injection (never trust FE Bearer).
+    let wire_line = match serde_json::from_str::<serde_json::Value>(&line) {
+        Ok(mut v) => {
+            if let Some(method) = v.get("method").and_then(|m| m.as_str()) {
+                if !acp_method_allowed(method) {
+                    return Err(format!("不允许的 ACP 方法：{method}"));
+                }
+                let method_owned = method.to_string();
+                if method_owned == "session/new" || method_owned == "session/load" {
+                    if let Some(params) = v.get_mut("params") {
+                        inject_computer_mcp_auth_into_params(params);
+                    }
+                }
             }
+            v.to_string()
         }
-    }
+        Err(_) => {
+            // Non-JSON still size-checked above; pass through (should not happen from FE).
+            line
+        }
+    };
     let mut guard = state.process.lock().await;
     let process = guard
         .as_mut()
@@ -8551,7 +8563,7 @@ async fn acp_send(
     }
     process
         .stdin
-        .write_all(line.as_bytes())
+        .write_all(wire_line.as_bytes())
         .await
         .map_err(|error| format!("写入 Grok Agent 失败：{error}"))?;
     process
@@ -8564,6 +8576,42 @@ async fn acp_send(
         .flush()
         .await
         .map_err(|error| format!("刷新 Grok Agent 输入失败：{error}"))
+}
+
+/// Host-only: put live Bearer on `grok_desktop_computer` MCP entries; strip any
+/// FE-supplied Authorization for that server (XSS must not plant tokens).
+fn inject_computer_mcp_auth_into_params(params: &mut serde_json::Value) {
+    let Some(servers) = params.get_mut("mcpServers").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+    let live = computer_mcp::live_mcp_endpoint();
+    for server in servers.iter_mut() {
+        let name = server
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if name != "grok_desktop_computer" {
+            continue;
+        }
+        let Some(obj) = server.as_object_mut() else {
+            continue;
+        };
+        // Always drop FE-provided headers for our desktop MCP surface.
+        obj.remove("headers");
+        if let Some(endpoint) = live.as_ref() {
+            obj.insert(
+                "url".into(),
+                serde_json::Value::String(endpoint.url.clone()),
+            );
+            obj.insert(
+                "headers".into(),
+                serde_json::json!([{
+                    "name": "Authorization",
+                    "value": format!("Bearer {}", endpoint.token)
+                }]),
+            );
+        }
+    }
 }
 
 #[tauri::command]
@@ -10062,6 +10110,34 @@ base_url = "https://ok.example"
         assert!(!acp_method_allowed("shell/exec"));
         assert!(!acp_method_allowed("eval"));
         assert!(!acp_method_allowed("_evil/hack"));
+    }
+
+    #[test]
+    fn inject_computer_mcp_auth_strips_fe_headers_without_live_server() {
+        let mut params = serde_json::json!({
+            "mcpServers": [{
+                "type": "http",
+                "name": "grok_desktop_computer",
+                "url": "http://127.0.0.1:9/mcp",
+                "headers": [{ "name": "Authorization", "value": "Bearer fe-planted-token" }]
+            }]
+        });
+        inject_computer_mcp_auth_into_params(&mut params);
+        let server = &params["mcpServers"][0];
+        // Without a live host endpoint, FE Authorization must still be stripped.
+        assert!(server.get("headers").is_none() || server["headers"].as_array().map(|a| a.is_empty()).unwrap_or(true));
+        let raw = server.to_string();
+        assert!(!raw.contains("fe-planted-token"));
+        assert!(!raw.contains("Bearer fe"));
+    }
+
+    #[test]
+    fn computer_session_extensions_closed_gate_has_no_bearer() {
+        let out = computer_session_extensions(Some(false)).expect("soft ok");
+        let raw = serde_json::to_string(&out).unwrap();
+        assert!(!raw.contains("Bearer "));
+        assert!(out.mcp_servers.is_empty());
+        assert!(out.lease_id.is_empty());
     }
 
 }

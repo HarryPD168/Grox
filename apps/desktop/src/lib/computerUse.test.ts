@@ -73,6 +73,17 @@ describe("computerUse opt-in", () => {
     expect(isComputerUseOperatorEnabled()).toBe(false);
   });
 
+  it("computerLeaseIfAttached accepts mcp server without Authorization headers (0.2.29)", () => {
+    // Host injects Bearer on acp_send; FE only needs non-empty mcpServers + lease.
+    expect(
+      computerLeaseIfAttached({
+        mcpServers: [{ type: "http", name: "grok_desktop_computer", url: "http://127.0.0.1:1/mcp" }],
+        pluginDirs: ["C:\\plugin"],
+        leaseId: "abcd",
+      }),
+    ).toBe("abcd");
+  });
+
   it("host prefs false blocks stale localStorage opt-in (0.2.26)", () => {
     localStorage.setItem(COMPUTER_USE_STORAGE_KEY, "1");
     setComputerUseHostPrefsEnabled(false);

@@ -133,7 +133,24 @@ fn uuid_token() -> Result<String, String> {
 fn current_http_auth() -> Option<(String, String)> {
     let shared = HTTP_SERVER.get()?;
     let auth = shared.auth.lock().ok()?;
+    if auth.token.is_empty() {
+        return None;
+    }
     Some((auth.token.clone(), auth.lease_id.clone()))
+}
+
+/// Live MCP HTTP endpoint for host-side injection into ACP stdin (0.2.29).
+/// WebView must never receive the bearer; `acp_send` merges Authorization.
+pub fn live_mcp_endpoint() -> Option<HttpEndpoint> {
+    let shared = HTTP_SERVER.get()?;
+    let auth = shared.auth.lock().ok()?;
+    if auth.token.is_empty() {
+        return None;
+    }
+    Some(HttpEndpoint {
+        url: shared.url.clone(),
+        token: auth.token.clone(),
+    })
 }
 
 /// Constant-time equality for bearer tokens (length mismatch still fails closed).
