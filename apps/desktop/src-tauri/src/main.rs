@@ -8458,9 +8458,15 @@ fn acp_set_silent_stream(
 
 /// Methods the desktop shell is allowed to write on the ACP stdin channel.
 /// Unknown methods from a compromised WebView are rejected (review R6b).
+///
+/// Wire note: FE `wireMethod` prefixes extension notifies as `_x.ai/...`
+/// (e.g. `_x.ai/yolo_mode_changed` when switching missions / permission mode).
+/// That leading underscore must be allowed or every window switch floods errors.
 fn acp_method_allowed(method: &str) -> bool {
+    // Normalize extension notify form: `_x.ai/foo` → treat like `x.ai/foo`.
+    let m = method.strip_prefix('_').unwrap_or(method);
     matches!(
-        method,
+        m,
         "session/new"
             | "session/load"
             | "session/prompt"
@@ -8499,9 +8505,12 @@ fn acp_method_allowed(method: &str) -> bool {
             | "x.ai/billing"
             | "x.ai/config"
             | "x.ai/mcp/status"
-    ) || method.starts_with("session/")
-        || method.starts_with("x.ai/")
-        || method.starts_with("terminal/")
+            | "x.ai/yolo_mode_changed"
+            | "x.ai/queue/changed"
+    ) || m.starts_with("session/")
+        || m.starts_with("x.ai/")
+        || m.starts_with("terminal/")
+        || m.starts_with("fs/")
 }
 
 #[tauri::command]
@@ -10039,6 +10048,20 @@ base_url = "https://ok.example"
         assert!(!redacted.contains("env-secret"));
         assert!(redacted.contains(CONFIG_SECRET_REDACTED));
         assert!(redacted.contains("base_url"));
+    }
+
+    #[test]
+    fn acp_method_allows_wire_xai_notify_with_underscore_prefix() {
+        // FE wireMethod: "x.ai/yolo_mode_changed" → "_x.ai/yolo_mode_changed"
+        assert!(acp_method_allowed("_x.ai/yolo_mode_changed"));
+        assert!(acp_method_allowed("x.ai/yolo_mode_changed"));
+        assert!(acp_method_allowed("_x.ai/queue/changed"));
+        assert!(acp_method_allowed("session/prompt"));
+        assert!(acp_method_allowed("x.ai/interject"));
+        // Still reject arbitrary / dangerous methods
+        assert!(!acp_method_allowed("shell/exec"));
+        assert!(!acp_method_allowed("eval"));
+        assert!(!acp_method_allowed("_evil/hack"));
     }
 
 }

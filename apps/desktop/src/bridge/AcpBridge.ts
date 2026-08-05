@@ -3436,8 +3436,11 @@ export class AcpBridge implements GrokBridge {
       auto_mode: mode === "auto",
       ...(sessionId ? { sessionId } : {}),
     }).catch((error) => {
-      for (const id of this.knownSessions) {
-        this.emit({ type: "error", sessionId: id, message: errorText(error) });
+      // Only surface on the active mission — broadcasting to every known session
+      // multiplies the same soft failure when switching windows (0.2.26 allowlist miss).
+      const target = sessionId ?? this.activeSessionId();
+      if (target) {
+        this.emit({ type: "error", sessionId: target, message: errorText(error) });
       }
     });
     // Switching into YOLO must clear already-painted tool cards; otherwise the
