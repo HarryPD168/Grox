@@ -2463,15 +2463,16 @@ export const useDesktop = create<DesktopState>((set, get) => {
         // 0.2.20: gate ignores FE-only localStorage; migrate former FE opt-in once.
         if (bridge.kind === "acp") {
           try {
+            // Always seal the one-shot FE→host migration latch (even when FE was
+            // never opted in) so later localStorage=1 cannot open host CU without
+            // Settings confirm (review P1).
             let feCu = false;
             try {
               feCu = localStorage.getItem("grox.computerUseEnabled") === "1";
             } catch {
               /* ignore */
             }
-            if (feCu) {
-              await invoke("host_prefs_migrate_computer_use", { feEnabled: true }).catch(() => {});
-            }
+            await invoke("host_prefs_migrate_computer_use", { feEnabled: feCu }).catch(() => {});
             const prefs = await invoke<{
               computerUseEnabled?: boolean;
               permissionMode?: string;
@@ -2791,14 +2792,21 @@ export const useDesktop = create<DesktopState>((set, get) => {
         if (current.activeId === id && current.sessions[id] && current.view === "session") {
           // Still upgrade offline history if we never finished — but never restart
           // an in-flight scan (that killed the worker and froze the progress bar).
+          // Upgrade force must pass force:true (same as full open) so Wave-1
+          // fingerprint cannot re-serve a pre-enrich transcript (review P0).
+          const forceScan = upgradeForceOfflineRescan;
+          const needScan =
+            forceScan ||
+            (!offlineHistoryComplete.has(id) &&
+              current.historyLoadMode !== "disk" &&
+              current.historyLoadMode !== "agent");
           if (
             bridge.kind === "acp" &&
-            !offlineHistoryComplete.has(id) &&
+            needScan &&
             !offlineHistoryScanning.has(id) &&
-            current.historyLoadMode !== "disk" &&
-            current.historyLoadMode !== "agent" &&
             !promptInFlightSessions.has(id)
           ) {
+            if (forceScan) offlineHistoryComplete.delete(id);
             offlineHistoryScanning.add(id);
             set({ fullHistoryLoadingId: id, historyLoadMode: "disk" });
             startOfflineScanPoll(id);
@@ -2807,6 +2815,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
               title: current.sessions[id]?.title ?? null,
               cwd: current.sessions[id]?.cwd ?? null,
               model: current.sessions[id]?.model ?? null,
+              force: forceScan,
             }).catch((error) => {
               console.warn("start_offline_session_history failed", error);
               offlineHistoryScanning.delete(id);
@@ -2867,10 +2876,15 @@ export const useDesktop = create<DesktopState>((set, get) => {
           if (offlineHistoryComplete.has(id) && !forceScan) return;
           if (forceScan) offlineHistoryComplete.delete(id);
           // Already scanning this id — join poll, do not re-invoke.
-          if (offlineHistoryScanning.has(id)) {
+          // Force (upgrade) may cancel a non-force short-circuit and re-start.
+          if (offlineHistoryScanning.has(id) && !forceScan) {
             set({ fullHistoryLoadingId: id, historyLoadMode: "disk" });
             startOfflineScanPoll(id);
             return;
+          }
+          if (offlineHistoryScanning.has(id) && forceScan) {
+            void invoke("cancel_offline_session_history").catch(() => {});
+            offlineHistoryScanning.delete(id);
           }
           offlineHistoryScanning.add(id);
           set({

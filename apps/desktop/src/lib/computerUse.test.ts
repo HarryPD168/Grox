@@ -13,6 +13,7 @@ import {
   isComputerUseOperatorEnabled,
   resetComputerUseHostEnvCache,
   setComputerUseHostEnvEnabled,
+  setComputerUseHostPrefsEnabled,
   setComputerUseOperatorEnabled,
 } from "./computerUse";
 
@@ -70,6 +71,17 @@ describe("computerUse opt-in", () => {
     expect(isComputerUseOperatorEnabled()).toBe(true);
     setComputerUseHostEnvEnabled(false);
     expect(isComputerUseOperatorEnabled()).toBe(false);
+  });
+
+  it("host prefs false blocks stale localStorage opt-in (0.2.26)", () => {
+    localStorage.setItem(COMPUTER_USE_STORAGE_KEY, "1");
+    setComputerUseHostPrefsEnabled(false);
+    delete envBag()[COMPUTER_USE_ENV_KEY];
+    setComputerUseHostEnvEnabled(false);
+    expect(isComputerUseOperatorEnabled()).toBe(false);
+    // Host true wins.
+    setComputerUseHostPrefsEnabled(true);
+    expect(isComputerUseOperatorEnabled()).toBe(true);
   });
 
   it("parses env flag shapes", () => {

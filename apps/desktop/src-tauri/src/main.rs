@@ -1435,6 +1435,53 @@ fn is_blocked_ssrf_v4(v4: std::net::Ipv4Addr) -> bool {
     false
 }
 
+/// Resolve DNS and reject if any A/AAAA is cloud IMDS / link-local.
+/// Does **not** block private LAN (10/8, 192.168/16) — intentional for Ollama/proxies.
+fn host_resolves_to_blocked_imds(host: &str) -> bool {
+    use std::net::{SocketAddr, ToSocketAddrs};
+    let host = host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.');
+    if host.is_empty() {
+        return true;
+    }
+    // Literal IP path
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => is_blocked_ssrf_v4(v4),
+            std::net::IpAddr::V6(v6) => {
+                if let Some(v4) = v6.to_ipv4_mapped() {
+                    is_blocked_ssrf_v4(v4)
+                } else {
+                    v6.is_unspecified()
+                }
+            }
+        };
+    }
+    // DNS: any resolved address on denylist → block
+    let candidates = [format!("{host}:443"), format!("{host}:80")];
+    for c in candidates {
+        if let Ok(iter) = c.to_socket_addrs() {
+            for sa in iter {
+                match sa {
+                    SocketAddr::V4(v4) if is_blocked_ssrf_v4(*v4.ip()) => return true,
+                    SocketAddr::V6(v6) => {
+                        if let Some(mapped) = v6.ip().to_ipv4_mapped() {
+                            if is_blocked_ssrf_v4(mapped) {
+                                return true;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Cloud metadata / link-local targets — never call as provider base_url or open.
 /// R16: belt against SSRF to 169.254.169.254 and metadata DNS names.
 /// R17: IPv4-mapped IPv6 (::ffff:169.254.169.254), extra hostnames, Aliyun IMDS.
@@ -5149,10 +5196,15 @@ fn write_hidden_sessions(ids: Vec<String>) -> Result<(), String> {
 const SESSION_CACHE_MAX_BYTES: u64 = 12 * 1024 * 1024;
 
 fn session_cache_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    app.path()
+    let dir = app
+        .path()
         .app_config_dir()
         .map(|directory| directory.join("session-cache"))
-        .map_err(|error| format!("无法定位会话缓存目录：{error}"))
+        .map_err(|error| format!("无法定位会话缓存目录：{error}"))?;
+    fs::create_dir_all(&dir).map_err(|e| format!("无法创建 session-cache 目录：{e}"))?;
+    // Best-effort ACL so transcript JSON inherits user-only permissions.
+    let _ = restrict_private_file(&dir);
+    Ok(dir)
 }
 
 fn session_cache_path(app: &tauri::AppHandle, id: &str) -> Result<PathBuf, String> {
@@ -5227,6 +5279,9 @@ fn write_ui_transcript(
     if size > scanned_bytes.saturating_add(64) {
         return Ok(());
     }
+    // Within slack: pin fingerprint size/scanned to the scanned length so read
+    // (strict scannedBytes == updatesSize) never rejects a write we just made.
+    let pin_size = scanned_bytes.min(size);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -5236,9 +5291,9 @@ fn write_ui_transcript(
         "sessionId": session_id,
         "writtenAtMs": now,
         "source": {
-            "updatesSize": size,
+            "updatesSize": pin_size,
             "updatesMtimeMs": mtime_ms,
-            "scannedBytes": scanned_bytes,
+            "scannedBytes": pin_size,
         },
         "scan": {
             "complete": true,
@@ -5826,11 +5881,12 @@ fn start_offline_session_history(
     if safe.is_empty() {
         return Err("无效的会话 ID".into());
     }
-    // Same-id re-entry while truly running: join. If ACTIVE_ID is stale (worker
-    // died without clear), allow restart so the bar cannot stick forever.
+    // Same-id re-entry while truly running: join (unless force — upgrade must
+    // abandon a non-force Wave-1 short-circuit / partial worker and re-scan).
+    // If ACTIVE_ID is stale (worker died without clear), allow restart.
     if let Ok(mut guard) = OFFLINE_HISTORY_ACTIVE_ID.lock() {
         if guard.as_str() == safe {
-            if SCAN_DONE.load(Ordering::Relaxed) == 0 {
+            if !force && SCAN_DONE.load(Ordering::Relaxed) == 0 {
                 return Ok(());
             }
             guard.clear();
@@ -5847,6 +5903,7 @@ fn start_offline_session_history(
     SCAN_LINES.store(0, Ordering::Relaxed);
     SCAN_BLOCKS.store(0, Ordering::Relaxed);
     SCAN_TOTAL.store(0, Ordering::Relaxed);
+    let safe_for_spawn_err = safe.clone();
     std::thread::Builder::new()
         .name(format!("offline-hist-{safe}"))
         .spawn(move || {
@@ -6568,10 +6625,15 @@ fn start_offline_session_history(
                 );
             }
         })
-        .map_err(|e| {
+        .map_err(move |e| {
             scan_progress_finish_if(gen, "error");
-            if let Ok(mut guard) = OFFLINE_HISTORY_ACTIVE_ID.lock() {
-                guard.clear();
+            // Gen-scoped: do not wipe a newer scan's ACTIVE_ID (review P1).
+            if OFFLINE_HISTORY_GEN.load(Ordering::SeqCst) == gen {
+                if let Ok(mut guard) = OFFLINE_HISTORY_ACTIVE_ID.lock() {
+                    if guard.as_str() == safe_for_spawn_err {
+                        guard.clear();
+                    }
+                }
             }
             format!("无法启动离线历史线程：{e}")
         })?;
@@ -6878,33 +6940,47 @@ fn is_redacted_config_secret(value: &str) -> bool {
         || v.contains('…')
 }
 
-/// Strip `api_key = "..."` / env-style key lines before config content enters the WebView.
+/// True when a config key name should never enter the WebView as a real secret.
+fn is_secret_config_key_name(key: &str) -> bool {
+    let k = key.trim();
+    let lower = k.to_ascii_lowercase();
+    if lower == "api_key"
+        || lower == "apikey"
+        || lower == "authorization"
+        || lower == "auth_token"
+        || lower == "access_token"
+        || lower == "refresh_token"
+        || lower == "secret"
+        || lower == "password"
+        || lower == "token"
+        || lower == "bearer"
+    {
+        return true;
+    }
+    // Env-style and provider keys: *API_KEY, *_SECRET, *_TOKEN
+    lower.ends_with("_api_key")
+        || lower.ends_with("api_key")
+        || lower.ends_with("_secret")
+        || lower.ends_with("_token")
+        || lower.ends_with("_password")
+}
+
+/// Strip secret key lines before config content enters the WebView (0.2.26 broaden).
 fn redact_config_document_secrets(content: &str) -> String {
     content
         .lines()
         .map(|line| {
             let trimmed = line.trim_start();
-            // TOML: api_key = "sk-..."
-            if let Some(rest) = trimmed
-                .strip_prefix("api_key")
-                .or_else(|| trimmed.strip_prefix("API_KEY"))
-            {
-                let rest = rest.trim_start();
-                if rest.starts_with('=') {
+            // TOML: key = "..."
+            if let Some((key_part, rest)) = trimmed.split_once('=') {
+                let key = key_part.trim().trim_matches('"').trim_matches('\'');
+                if is_secret_config_key_name(key) {
                     let indent_len = line.len() - trimmed.len();
                     let indent = &line[..indent_len];
-                    return format!("{indent}api_key = \"{CONFIG_SECRET_REDACTED}\"");
-                }
-            }
-            // Rare dotenv-in-toml mistakes
-            if let Some((key, _)) = trimmed.split_once('=') {
-                let key = key.trim();
-                if key.eq_ignore_ascii_case("XAI_API_KEY")
-                    || key.eq_ignore_ascii_case("OPENAI_API_KEY")
-                    || key.eq_ignore_ascii_case("ANTHROPIC_API_KEY")
-                {
-                    let indent_len = line.len() - trimmed.len();
-                    let indent = &line[..indent_len];
+                    // Preserve TOML style when original looked like TOML assignment.
+                    if rest.trim_start().starts_with('"') || rest.trim_start().starts_with('\'') {
+                        return format!("{indent}{key} = \"{CONFIG_SECRET_REDACTED}\"");
+                    }
                     return format!("{indent}{key}={CONFIG_SECRET_REDACTED}");
                 }
             }
@@ -7640,6 +7716,13 @@ async fn refresh_provider_models(id: String) -> Result<ProviderProfileSummary, S
         .find(|profile| profile.id == id)
         .ok_or("供应商档案不存在")?;
     let endpoint = compatible_models_url(&profile.base_url)?;
+    // DNS rebinding / IMDS-via-name: resolve host before sending the API key.
+    // Private LAN (10/8, 192.168/16) remains allowed for local Ollama/proxies.
+    if let Ok(parsed) = url::Url::parse(&endpoint) {
+        if host_resolves_to_blocked_imds(parsed.host_str().unwrap_or("")) {
+            return Err("模型服务地址解析到链路本地或云元数据，已拒绝".into());
+        }
+    }
     let plain_key = profile_api_key_plain(&profile)?;
     let response = provider_models_http_client()?
         .get(endpoint)
@@ -8373,6 +8456,54 @@ fn acp_set_silent_stream(
     }
 }
 
+/// Methods the desktop shell is allowed to write on the ACP stdin channel.
+/// Unknown methods from a compromised WebView are rejected (review R6b).
+fn acp_method_allowed(method: &str) -> bool {
+    matches!(
+        method,
+        "session/new"
+            | "session/load"
+            | "session/prompt"
+            | "session/cancel"
+            | "session/delete"
+            | "session/set_config_option"
+            | "session/setMode"
+            | "session/set_mode"
+            | "session/info"
+            | "session/list"
+            | "session/resume"
+            | "session/fork"
+            | "session/update"
+            | "initialize"
+            | "authenticate"
+            | "terminal/create"
+            | "terminal/output"
+            | "terminal/release"
+            | "terminal/wait_for_exit"
+            | "terminal/kill"
+            | "fs/read_text_file"
+            | "fs/write_text_file"
+            | "x.ai/interject"
+            | "x.ai/session/list"
+            | "x.ai/session/delete"
+            | "x.ai/session/update"
+            | "x.ai/session/prompt_queue"
+            | "x.ai/session/prompt_queue/list"
+            | "x.ai/session/prompt_queue/cancel"
+            | "x.ai/set_permission_mode"
+            | "x.ai/permission/respond"
+            | "x.ai/question/respond"
+            | "x.ai/model/list"
+            | "x.ai/model/set"
+            | "x.ai/account"
+            | "x.ai/billing"
+            | "x.ai/config"
+            | "x.ai/mcp/status"
+    ) || method.starts_with("session/")
+        || method.starts_with("x.ai/")
+        || method.starts_with("terminal/")
+}
+
 #[tauri::command]
 async fn acp_send(
     state: tauri::State<'_, Arc<AcpState>>,
@@ -8390,6 +8521,14 @@ async fn acp_send(
             line.len(),
             MAX_ACP_LINE_BYTES
         ));
+    }
+    // Method allowlist — reject unknown JSON-RPC methods from WebView.
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+        if let Some(method) = v.get("method").and_then(|m| m.as_str()) {
+            if !acp_method_allowed(method) {
+                return Err(format!("不允许的 ACP 方法：{method}"));
+            }
+        }
     }
     let mut guard = state.process.lock().await;
     let process = guard
@@ -9714,6 +9853,192 @@ api_key = "********"
         assert_eq!(SCAN_DONE.load(Ordering::Relaxed), 1);
         // Restore done for other tests (best-effort).
         SCAN_DONE.store(0, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn enrich_users_inserts_missing_before_shared_anchor_in_chat_order() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("grox-enrich-users-{stamp}"));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // chat_history: A then B then C; offline scan only has C.
+        let chat = r#"{"type":"user","content":[{"type":"text","text":"<user_query>\nA done\n</user_query>"}]}
+{"type":"user","content":[{"type":"text","text":"<user_query>\nB try\n</user_query>"}]}
+{"type":"user","content":[{"type":"text","text":"<user_query>\nC go\n</user_query>"}]}
+"#;
+        fs::write(dir.join("chat_history.jsonl"), chat).unwrap();
+        let mut blocks = vec![serde_json::json!({
+            "type": "user",
+            "id": "off-c",
+            "text": "C go",
+            "ts": 1
+        })];
+        enrich_users_from_chat_history(&dir, &mut blocks, 1);
+        let texts: Vec<String> = blocks
+            .iter()
+            .filter_map(|b| {
+                if b.get("type").and_then(|t| t.as_str()) == Some("user") {
+                    b.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(texts, vec!["A done", "B try", "C go"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_ui_transcript_fresh_matrix_size_mtime_scanned() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("grox-ui-fp-{stamp}"));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let updates = dir.join("updates.jsonl");
+        fs::write(&updates, b"{\"x\":1}\n").unwrap();
+        let (size, mtime) = file_size_mtime_ms(&updates).expect("stat");
+        let session = serde_json::json!({
+            "id": "sess-1",
+            "blocks": [{"type":"user","id":"u","text":"hi","ts":1}],
+            "status": "idle"
+        });
+        // Complete match → HIT
+        let env_ok = serde_json::json!({
+            "schema": 1,
+            "sessionId": "sess-1",
+            "source": {
+                "updatesSize": size,
+                "updatesMtimeMs": mtime,
+                "scannedBytes": size
+            },
+            "scan": { "complete": true },
+            "session": session
+        });
+        fs::write(
+            dir.join("grox-ui-transcript.v1.json"),
+            env_ok.to_string(),
+        )
+        .unwrap();
+        assert!(
+            read_ui_transcript_if_fresh(&dir, "sess-1").is_some(),
+            "size+mtime+scanned match must HIT"
+        );
+        // Size mismatch → MISS
+        let env_size = serde_json::json!({
+            "schema": 1,
+            "sessionId": "sess-1",
+            "source": {
+                "updatesSize": size + 99,
+                "updatesMtimeMs": mtime,
+                "scannedBytes": size + 99
+            },
+            "scan": { "complete": true },
+            "session": session
+        });
+        fs::write(
+            dir.join("grox-ui-transcript.v1.json"),
+            env_size.to_string(),
+        )
+        .unwrap();
+        assert!(
+            read_ui_transcript_if_fresh(&dir, "sess-1").is_none(),
+            "size mismatch must MISS"
+        );
+        // scannedBytes != size → MISS
+        let env_scan = serde_json::json!({
+            "schema": 1,
+            "sessionId": "sess-1",
+            "source": {
+                "updatesSize": size,
+                "updatesMtimeMs": mtime,
+                "scannedBytes": size.saturating_sub(1).max(0)
+            },
+            "scan": { "complete": true },
+            "session": session
+        });
+        fs::write(
+            dir.join("grox-ui-transcript.v1.json"),
+            env_scan.to_string(),
+        )
+        .unwrap();
+        if size > 0 {
+            assert!(
+                read_ui_transcript_if_fresh(&dir, "sess-1").is_none(),
+                "scannedBytes != size must MISS"
+            );
+        }
+        // mtime skew within 60s + size match → HIT (omit scanned for legacy)
+        let env_skew = serde_json::json!({
+            "schema": 1,
+            "sessionId": "sess-1",
+            "source": {
+                "updatesSize": size,
+                "updatesMtimeMs": mtime.saturating_sub(5_000)
+            },
+            "scan": { "complete": true },
+            "session": session
+        });
+        fs::write(
+            dir.join("grox-ui-transcript.v1.json"),
+            env_skew.to_string(),
+        )
+        .unwrap();
+        assert!(
+            read_ui_transcript_if_fresh(&dir, "sess-1").is_some(),
+            "small mtime skew with size match must HIT"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_ui_transcript_refuses_when_file_grew_past_scanned() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("grox-ui-write-{stamp}"));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let updates = dir.join("updates.jsonl");
+        // Need size > scanned + 64 (TOCTOU slack in write_ui_transcript).
+        let body = format!("{}\n", "x".repeat(400));
+        fs::write(&updates, body.as_bytes()).unwrap();
+        let (size, _) = file_size_mtime_ms(&updates).unwrap();
+        let session = serde_json::json!({"id":"s","blocks":[],"status":"idle"});
+        let scanned_short = size.saturating_sub(200);
+        write_ui_transcript(&dir, "s", &session, &updates, scanned_short).unwrap();
+        assert!(
+            !ui_transcript_path(&dir).is_file(),
+            "incomplete scan must not write durable transcript"
+        );
+        // scanned == size → written and fresh
+        write_ui_transcript(&dir, "s", &session, &updates, size).unwrap();
+        assert!(read_ui_transcript_if_fresh(&dir, "s").is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn redact_config_broadens_token_and_secret_keys() {
+        let raw = r#"
+authorization = "Bearer secret-token"
+api_key = "sk-abc"
+custom_secret = "shhh"
+OPENAI_API_KEY=env-secret
+base_url = "https://ok.example"
+"#;
+        let redacted = redact_config_document_secrets(raw);
+        assert!(!redacted.contains("Bearer secret-token"));
+        assert!(!redacted.contains("sk-abc"));
+        assert!(!redacted.contains("shhh"));
+        assert!(!redacted.contains("env-secret"));
+        assert!(redacted.contains(CONFIG_SECRET_REDACTED));
+        assert!(redacted.contains("base_url"));
     }
 
 }

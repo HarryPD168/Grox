@@ -56,11 +56,24 @@ function readProcessEnvComputerUse(): string | undefined {
 }
 
 /**
- * Computer Use requires Settings toggle **or** host env GROX_COMPUTER_USE=1
- * (advanced) **or** host-attested native prefs. Default is off.
+ * Computer Use operator-facing opt-in (0.2.26).
+ *
+ * Host-attested prefs are authority once loaded:
+ * - host true → enabled
+ * - host false → disabled (localStorage alone cannot re-open)
+ * - host null (not yet loaded) → fall back to localStorage / env for cold UI
+ *
+ * Rust product gate still ignores FE entirely (env|host_prefs only).
  */
 export function isComputerUseOperatorEnabled(): boolean {
   if (hostPrefsComputerUse === true) return true;
+  if (hostPrefsComputerUse === false) {
+    // Explicit host opt-out: do not let stale localStorage claim opt-in
+    // (would choose "attach" then soft-fail with no MCP / no refuse copy).
+    if (hostEnvEnabled === true) return true;
+    if (isComputerUseEnvFlag(readProcessEnvComputerUse())) return true;
+    return false;
+  }
   try {
     if (typeof localStorage !== "undefined") {
       if (localStorage.getItem(COMPUTER_USE_STORAGE_KEY) === "1") return true;
@@ -71,6 +84,14 @@ export function isComputerUseOperatorEnabled(): boolean {
   if (hostEnvEnabled === true) return true;
   if (isComputerUseEnvFlag(readProcessEnvComputerUse())) return true;
   return false;
+}
+
+/** Soft copy when opt-in is on but MCP/plugin did not attach (Windows only). */
+export function computerUseAttachFailedMessage(): string {
+  return tOp(
+    "Computer Use 未能附加（MCP/插件不可用）。本回合将不控制桌面，可稍后重试。",
+    "Computer Use could not attach (MCP/plugin unavailable). This turn will not control the desktop; try again later.",
+  );
 }
 
 /**

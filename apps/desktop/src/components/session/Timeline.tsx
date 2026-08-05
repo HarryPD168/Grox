@@ -22,6 +22,12 @@ import { PlanCard } from "./PlanCard";
 import { PermissionCard } from "./PermissionCard";
 import { QuestionCard } from "./QuestionCard";
 import { TurnChangeCard } from "./TurnChangeCard";
+import {
+  canReleasePinningFlag,
+  pinLayoutRetryDelayMs,
+  pinReleaseDelayMs,
+  shouldPinBottomOnIdleGrow,
+} from "../../lib/timelineScrollPolicy";
 
 interface Turn {
   id: string;
@@ -583,22 +589,19 @@ export function Timeline({ session }: { session: Session }) {
       Date.now() + suppressMs,
     );
     el.scrollTop = el.scrollHeight;
-    // Re-apply after late layout (folds/markdown). Cap at 320ms — do NOT clear
-    // pinningRef here when suppressMs is longer (open uses 2000ms); otherwise
-    // the early timeout never clears pin and unfollow stays dead (review P1).
+    // Re-apply after late layout (folds/markdown). Cap via pinLayoutRetryDelayMs —
+    // pin release uses full suppressMs (timelineScrollPolicy; open 2s path).
     window.setTimeout(() => {
       const node = scrollerRef.current;
       if (node && followRef.current) {
         node.scrollTop = node.scrollHeight;
       }
-    }, Math.min(suppressMs, 320));
-    // Always release pin when this suppress window ends (unless a later pin
-    // extended suppressUnfollowUntilRef past this deadline).
+    }, pinLayoutRetryDelayMs(suppressMs));
     window.setTimeout(() => {
-      if (Date.now() >= suppressUnfollowUntilRef.current - 50) {
+      if (canReleasePinningFlag(Date.now(), suppressUnfollowUntilRef.current)) {
         pinningRef.current = false;
       }
-    }, suppressMs);
+    }, pinReleaseDelayMs(suppressMs));
     return true;
   }, []);
 
@@ -717,12 +720,16 @@ export function Timeline({ session }: { session: Session }) {
     if (grew) {
       const newH = el.scrollHeight;
       const delta = newH - (prevH || 0);
-      // Open-window enrich: always re-stick to bottom (user did not scroll away
-      // to "read history" within suppress window after open).
       const inOpenGrace = Date.now() < suppressUnfollowUntilRef.current;
-      if (followRef.current || inOpenGrace || prevLen === 0) {
+      const growMode = shouldPinBottomOnIdleGrow({
+        grew: true,
+        follow: followRef.current,
+        inOpenGrace,
+        prevLen,
+      });
+      if (growMode === "pin") {
         pinBottomHard(1_500);
-      } else if (delta > 0) {
+      } else if (growMode === "anchor_delta" && delta > 0) {
         // User was reading history: keep visual anchor when content prepends.
         pinningRef.current = true;
         el.scrollTop += delta;

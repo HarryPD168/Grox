@@ -48,6 +48,7 @@ import {
   COMPUTER_USE_OPT_IN_REFUSE_MESSAGE,
   computerLeaseIfAttached,
   computerToolNameFromPermissionTool,
+  computerUseAttachFailedMessage,
   computerUseOptInRefuseMessage,
   decideComputerAttachForPrompt,
   hasActiveComputerLease,
@@ -4774,9 +4775,15 @@ export class AcpBridge implements GrokBridge {
         }
         this.emitSoftError(sessionId, computerUseOptInRefuseMessage());
         return "refused";
-      case "attach":
+      case "attach": {
         await this.attachComputerMcp(sessionId);
+        // Honesty: opt-in path chose attach but soft-fail left no lease
+        // (gate closed on host, non-Windows, harness flake). Do not pretend CU is live.
+        if (!hasActiveComputerLease(this.computerLeases, sessionId)) {
+          this.emitSoftError(sessionId, computerUseAttachFailedMessage());
+        }
         return "ok";
+      }
     }
   }
 

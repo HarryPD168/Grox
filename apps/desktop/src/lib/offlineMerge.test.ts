@@ -178,6 +178,61 @@ describe("mergeOfflineWithLive (0.2.24 evidence-driven)", () => {
     expect(out.blocks.map((b) => b.id)).toEqual(["u1", "a1"]);
   });
 
+  it("preserves awaiting_permission and awaiting_input without offline rewrite", () => {
+    const pending = sess({
+      id: "a",
+      status: "idle",
+      blocks: [
+        { type: "user", id: "off", text: "hi", ts: 1 },
+        { type: "assistant", id: "off-a", text: "full offline body", ts: 2, streaming: false },
+      ],
+    });
+    for (const status of ["awaiting_permission", "awaiting_input"] as const) {
+      const cur = sess({
+        id: "a",
+        status,
+        blocks: [
+          { type: "user", id: "live", text: "hi", ts: 1 },
+          { type: "assistant", id: "live-a", text: "short", streaming: false, ts: 2 },
+        ],
+      });
+      const out = mergeOfflineWithLive(pending, cur);
+      expect(out.status).toBe(status);
+      expect(out.blocks.map((b) => b.id)).toEqual(["live", "live-a"]);
+    }
+  });
+
+  it("stabilize prefers longer offline body when live is truncated", () => {
+    // Content keys use first 240 chars — live must share that prefix to match.
+    const long = "x".repeat(500);
+    const pending = sess({
+      id: "a",
+      status: "idle",
+      blocks: [
+        { type: "user", id: "u", text: "q", ts: 1 },
+        { type: "assistant", id: "off-a", text: long, ts: 2, streaming: false },
+      ],
+    });
+    const cur = sess({
+      id: "a",
+      status: "idle",
+      blocks: [
+        { type: "user", id: "live-u", text: "q", ts: 1 },
+        {
+          type: "assistant",
+          id: "live-a",
+          text: long.slice(0, 240),
+          ts: 2,
+          streaming: false,
+        },
+      ],
+    });
+    const out = mergeOfflineWithLive(pending, cur);
+    const asst = out.blocks.find((b) => b.type === "assistant");
+    expect(asst && "text" in asst ? asst.text.length : 0).toBe(500);
+    expect(asst?.id).toBe("live-a");
+  });
+
   it("firstPrimaryUserBlock skips tools and interjects", () => {
     const blocks: Session["blocks"] = [
       {
