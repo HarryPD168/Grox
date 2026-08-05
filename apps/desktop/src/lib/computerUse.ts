@@ -18,15 +18,29 @@ export function isComputerUseEnvFlag(value: string | null | undefined): boolean 
 
 /** Host-process env cache (Tauri invoke); null = not yet refreshed. */
 let hostEnvEnabled: boolean | null = null;
+/** Host-attested native prefs cache (host_prefs.json via Tauri). */
+let hostPrefsComputerUse: boolean | null = null;
 
 /** Apply host env probe result (from `computer_use_env_enabled` command). */
 export function setComputerUseHostEnvEnabled(enabled: boolean): void {
   hostEnvEnabled = enabled;
 }
 
+/** Apply host-attested prefs from `host_prefs_get` (0.2.19). */
+export function setComputerUseHostPrefsEnabled(enabled: boolean): void {
+  hostPrefsComputerUse = enabled;
+  try {
+    if (enabled) localStorage.setItem(COMPUTER_USE_STORAGE_KEY, "1");
+    else localStorage.removeItem(COMPUTER_USE_STORAGE_KEY);
+  } catch {
+    /* ignore */
+  }
+}
+
 /** Test/reset helper — clears host env cache. */
 export function resetComputerUseHostEnvCache(): void {
   hostEnvEnabled = null;
+  hostPrefsComputerUse = null;
 }
 
 function readProcessEnvComputerUse(): string | undefined {
@@ -43,10 +57,10 @@ function readProcessEnvComputerUse(): string | undefined {
 
 /**
  * Computer Use requires Settings toggle **or** host env GROX_COMPUTER_USE=1
- * (advanced). Default is off. Host env is authoritative once refreshed via
- * Tauri; process.env is used in Node/vitest and as a bootstrap fallback.
+ * (advanced) **or** host-attested native prefs. Default is off.
  */
 export function isComputerUseOperatorEnabled(): boolean {
+  if (hostPrefsComputerUse === true) return true;
   try {
     if (typeof localStorage !== "undefined") {
       if (localStorage.getItem(COMPUTER_USE_STORAGE_KEY) === "1") return true;
@@ -59,7 +73,12 @@ export function isComputerUseOperatorEnabled(): boolean {
   return false;
 }
 
+/**
+ * Local mirror only. Prefer `setComputerUseOperatorEnabledHost` from Settings
+ * so the native host_prefs.json is updated with confirm dialog.
+ */
 export function setComputerUseOperatorEnabled(enabled: boolean): void {
+  hostPrefsComputerUse = enabled;
   try {
     if (enabled) localStorage.setItem(COMPUTER_USE_STORAGE_KEY, "1");
     else localStorage.removeItem(COMPUTER_USE_STORAGE_KEY);

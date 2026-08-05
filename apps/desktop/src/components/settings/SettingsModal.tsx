@@ -6,6 +6,7 @@ import { EFFORTS } from "../../bridge/types";
 import {
   isComputerUseOperatorEnabled,
   setComputerUseHostEnvEnabled,
+  setComputerUseHostPrefsEnabled,
   setComputerUseOperatorEnabled,
 } from "../../lib/computerUse";
 import {
@@ -512,17 +513,21 @@ function SupportDiagnostics({ zh, bridgeKind }: { zh: boolean; bridgeKind: strin
 function ComputerUseOptIn({ zh }: { zh: boolean }) {
   const [enabled, setEnabled] = useState(() => isComputerUseOperatorEnabled());
   const [envForced, setEnvForced] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   useEffect(() => {
-    // Align checkbox with host GROX_COMPUTER_USE when Settings opens (R4A-CU-03).
-    void invoke<boolean>("computer_use_env_enabled_cmd")
-      .then((on) => {
-        setComputerUseHostEnvEnabled(on === true);
-        setEnvForced(on === true);
-        setEnabled(isComputerUseOperatorEnabled());
-      })
-      .catch(() => {
-        /* non-tauri / older shell */
-      });
+    // Align with host env + host-attested prefs (0.2.19).
+    void Promise.all([
+      invoke<boolean>("computer_use_env_enabled_cmd").catch(() => false),
+      invoke<{ computerUseEnabled?: boolean }>("host_prefs_get").catch(() => null),
+    ]).then(([on, prefs]) => {
+      setComputerUseHostEnvEnabled(on === true);
+      setEnvForced(on === true);
+      if (prefs && typeof prefs.computerUseEnabled === "boolean") {
+        setComputerUseHostPrefsEnabled(prefs.computerUseEnabled);
+      }
+      setEnabled(isComputerUseOperatorEnabled());
+    });
   }, []);
   return (
     <Row
@@ -533,27 +538,43 @@ function ComputerUseOptIn({ zh }: { zh: boolean }) {
             ? "已由环境变量 GROX_COMPUTER_USE=1 启用（高级）。关闭设置开关仍会吊销本机 MCP，但 env 在下次启动仍会打开门控。"
             : "Enabled by host env GROX_COMPUTER_USE=1 (advanced). Turning the switch off revokes MCP now; env re-opens the gate on next ensure."
           : zh
-            ? "默认关闭。开启后挂载桌面控制 MCP，并对 Computer 工具自动批准（不必再点「仅本次允许」）。其它工具仍受上方「权限模式」约束。关闭会立即吊销本机 MCP。"
-            : "Off by default. When on, attaches the desktop MCP and auto-approves Computer tools (no extra Allow). Other tools still follow Permission mode above. Off revokes local MCP."
+            ? "默认关闭。开启会写入本机 host_prefs（原生确认），挂载桌面控制 MCP。关闭立即吊销 MCP。"
+            : "Off by default. Enabling writes host-attested prefs (native confirm) and attaches desktop MCP. Off revokes MCP."
       }
     >
       <label className="flex items-center gap-2 font-mono text-[10px] text-fg2">
         <input
           type="checkbox"
+          disabled={busy}
           checked={enabled}
           onChange={(event) => {
             const next = event.target.checked;
-            setEnabled(next);
-            setComputerUseOperatorEnabled(next);
-            // R4A-CU-01: disable-after-attach must not leave control live.
-            if (!next) void bridge.revokeComputerUseCapability?.().catch(() => {});
+            setBusy(true);
+            setError(null);
+            void invoke<{ computerUseEnabled?: boolean }>("host_prefs_set_computer_use", {
+              enabled: next,
+            })
+              .then((prefs) => {
+                const on = prefs?.computerUseEnabled === true;
+                setComputerUseHostPrefsEnabled(on);
+                setComputerUseOperatorEnabled(on);
+                setEnabled(on);
+                if (!on) void bridge.revokeComputerUseCapability?.().catch(() => {});
+              })
+              .catch((err) => {
+                setError(err instanceof Error ? err.message : String(err));
+                setEnabled(isComputerUseOperatorEnabled());
+              })
+              .finally(() => setBusy(false));
           }}
         />
         {enabled ? (zh ? "已启用" : "Enabled") : zh ? "已关闭" : "Disabled"}
         {envForced ? (
           <span className="text-dim">{zh ? "· ENV" : "· ENV"}</span>
         ) : null}
+        {busy ? <span className="text-dim">…</span> : null}
       </label>
+      {error ? <p className="mt-1 text-[10px] text-red">{error}</p> : null}
     </Row>
   );
 }

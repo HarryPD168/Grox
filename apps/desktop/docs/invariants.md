@@ -28,6 +28,9 @@ Focus suites: `permissionAuto`, `queueTurnPolicy`, `promptQueue`, `sessionGate`,
 | I-16 | Stop / FE timeout parks local queue; operator must **Resume queue** or send again (no surprise auto-drain) |
 | I-17 | First-event soft warn (post-bind) is `kind: info` only — must not match timeout classifier / park queue |
 | I-18 | CU sticky stop on kill is fail-closed (emergency_stop failure → revoke bearer) |
+| I-19 | Windows ACP child is in a Job Object; terminate kills the process tree |
+| I-20 | Computer Use + Bypass prefer host-attested `host_prefs.json` (native confirm on enable) |
+| I-21 | Shell polls agent process liveness and emits `acp-exit` if the child dies silently |
 
 ## UI honesty
 

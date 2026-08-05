@@ -7,6 +7,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod computer_mcp;
+mod host_prefs;
+#[cfg(windows)]
+mod process_job;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -81,6 +84,9 @@ struct AgentProcess {
     child: Child,
     stdin: ChildStdin,
     generation: u64,
+    /// Windows: job object so cancel kills the full process tree (0.2.19).
+    #[cfg(windows)]
+    job: Option<process_job::ProcessJob>,
 }
 
 #[derive(Default)]
@@ -2523,6 +2529,14 @@ async fn start_project_preview(
 
 async fn terminate_process(mut process: AgentProcess) {
     drop(process.stdin);
+    // Job Object first: kills grandchildren (cargo test / nested shells) that
+    // child.kill() alone would orphan on Windows (platform debt 0.2.19).
+    #[cfg(windows)]
+    if let Some(job) = process.job.take() {
+        job.terminate_tree();
+        // Drop closes the job handle (KILL_ON_JOB_CLOSE).
+        drop(job);
+    }
     let _ = process.child.kill().await;
     let _ = process.child.wait().await;
 }
@@ -4609,8 +4623,145 @@ Use only the grok_desktop_computer MCP tools for an explicit `/computer` or `@Co
 }
 
 /// Product gate shared by the tauri command (unit-testable).
+/// Host-attested prefs (native file) + FE flag + env (0.2.19).
 fn computer_use_gate_open(operator_enabled: Option<bool>) -> bool {
-    computer_use_env_enabled() || operator_enabled == Some(true)
+    if computer_use_env_enabled() {
+        return true;
+    }
+    if operator_enabled == Some(true) {
+        return true;
+    }
+    // Host-attested native prefs (not only webview localStorage).
+    host_prefs::load_prefs(&host_prefs_app_data_dir()).computer_use_enabled
+}
+
+/// Resolve app data dir for host prefs (best-effort without AppHandle).
+fn host_prefs_app_data_dir() -> PathBuf {
+    // Prefer same root Tauri uses for app data when available at runtime;
+    // commands pass AppHandle. For gate checks mid-request we use a stable path.
+    if let Some(dir) = dirs_next_app_data() {
+        return dir;
+    }
+    std::env::temp_dir().join("grox-desktop-host-prefs")
+}
+
+/// Approximate Tauri app data without AppHandle (Windows/macOS/Linux).
+fn dirs_next_app_data() -> Option<PathBuf> {
+    // Matches tauri.conf.json identifier `dev.grox.desktop`.
+    const APP_ID: &str = "dev.grox.desktop";
+    #[cfg(windows)]
+    {
+        std::env::var_os("APPDATA").map(|p| PathBuf::from(p).join(APP_ID))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::env::var_os("HOME").map(|p| {
+            PathBuf::from(p)
+                .join("Library")
+                .join("Application Support")
+                .join(APP_ID)
+        })
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+            .map(|p| p.join(APP_ID))
+    }
+    #[cfg(not(any(windows, target_os = "macos", unix)))]
+    {
+        None
+    }
+}
+
+fn host_prefs_dir_for_app(app: &tauri::AppHandle) -> PathBuf {
+    app.path()
+        .app_data_dir()
+        .unwrap_or_else(|_| host_prefs_app_data_dir())
+}
+
+#[tauri::command]
+fn host_prefs_get(app: tauri::AppHandle) -> host_prefs::HostPrefs {
+    host_prefs::load_prefs(&host_prefs_dir_for_app(&app))
+}
+
+/// Persist Computer Use opt-in on the host (native file). Enabling can prompt
+/// a native confirm dialog so FE/localStorage alone cannot silently enable.
+#[tauri::command]
+fn host_prefs_set_computer_use(app: tauri::AppHandle, enabled: bool) -> Result<host_prefs::HostPrefs, String> {
+    let dir = host_prefs_dir_for_app(&app);
+    let mut prefs = host_prefs::load_prefs(&dir);
+    if enabled && !prefs.computer_use_enabled {
+        // Native confirm — host-attested opt-in (platform debt).
+        let accepted = rfd::MessageDialog::new()
+            .set_title("Grox Computer Use")
+            .set_description(
+                "Enable Computer Use (desktop control)? The agent may control windows and input when you explicitly request it.",
+            )
+            .set_buttons(rfd::MessageButtons::OkCancel)
+            .set_level(rfd::MessageLevel::Warning)
+            .show()
+            == rfd::MessageDialogResult::Ok;
+        if !accepted {
+            return Err("已取消启用 Computer Use".into());
+        }
+    }
+    prefs.computer_use_enabled = enabled;
+    host_prefs::save_prefs(&dir, &prefs)?;
+    Ok(prefs)
+}
+
+#[tauri::command]
+fn host_prefs_set_permission_mode(
+    app: tauri::AppHandle,
+    mode: String,
+) -> Result<host_prefs::HostPrefs, String> {
+    let mode = host_prefs::normalize_permission_mode(&mode)
+        .ok_or_else(|| "无效的 permission mode".to_string())?;
+    let dir = host_prefs_dir_for_app(&app);
+    let mut prefs = host_prefs::load_prefs(&dir);
+    if mode == "bypass" && prefs.permission_mode != "bypass" {
+        let accepted = rfd::MessageDialog::new()
+            .set_title("Grox Bypass 权限")
+            .set_description(
+                "Enable Bypass / YOLO permission mode? Tools may run with fewer confirmation prompts.",
+            )
+            .set_buttons(rfd::MessageButtons::OkCancel)
+            .set_level(rfd::MessageLevel::Warning)
+            .show()
+            == rfd::MessageDialogResult::Ok;
+        if !accepted {
+            return Err("已取消启用 Bypass 模式".into());
+        }
+    }
+    prefs.permission_mode = mode.to_string();
+    host_prefs::save_prefs(&dir, &prefs)?;
+    Ok(prefs)
+}
+
+#[tauri::command]
+fn host_prefs_set_prompt_timeouts(
+    app: tauri::AppHandle,
+    idle_minutes: Option<u32>,
+    absolute_hours: Option<u32>,
+) -> Result<host_prefs::HostPrefs, String> {
+    let dir = host_prefs_dir_for_app(&app);
+    let mut prefs = host_prefs::load_prefs(&dir);
+    if let Some(m) = idle_minutes {
+        if m < 5 || m > 24 * 60 {
+            return Err("idle 分钟需在 5–1440 之间".into());
+        }
+        prefs.prompt_idle_minutes = Some(m);
+    }
+    if let Some(h) = absolute_hours {
+        if h < 1 || h > 24 {
+            return Err("absolute 小时需在 1–24 之间".into());
+        }
+        prefs.prompt_absolute_hours = Some(h);
+    }
+    host_prefs::save_prefs(&dir, &prefs)?;
+    Ok(prefs)
 }
 
 /// Pure parser for GROX_COMPUTER_USE (unit-testable without process-global set_var races).
@@ -7868,10 +8019,67 @@ async fn acp_spawn(
         .stderr
         .take()
         .ok_or_else(|| "Grok CLI 未提供标准错误".to_string())?;
+    // Windows: put ACP child in a Job Object so cancel kills nested tool trees.
+    #[cfg(windows)]
+    let job = {
+        match process_job::ProcessJob::create_kill_on_close() {
+            Ok(job) => {
+                if let Some(pid) = child.id() {
+                    if let Err(error) = job.assign_pid(pid) {
+                        eprintln!("grox: AssignProcessToJobObject failed: {error}");
+                    }
+                }
+                Some(job)
+            }
+            Err(error) => {
+                eprintln!("grox: CreateJobObject failed (orphan risk on cancel): {error}");
+                None
+            }
+        }
+    };
+
     *state.process.lock().await = Some(AgentProcess {
         child,
         stdin,
         generation,
+        #[cfg(windows)]
+        job,
+    });
+
+    // Shell-side liveness: if the agent dies without a clean exit event, emit
+    // acp-exit so FE reconnects (protocol-level heartbeat still needs agent support).
+    let liveness_app = app.clone();
+    let liveness_state = state.inner().clone();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            if liveness_state.next_generation.load(Ordering::Relaxed) != generation {
+                break;
+            }
+            let mut guard = liveness_state.process.lock().await;
+            let Some(process) = guard.as_mut() else {
+                break;
+            };
+            if process.generation != generation {
+                break;
+            }
+            match process.child.try_wait() {
+                Ok(Some(status)) => {
+                    let _ = guard.take();
+                    drop(guard);
+                    let _ = liveness_app.emit(
+                        "acp-exit",
+                        AcpExitPayload {
+                            code: status.code(),
+                            reason: "exited",
+                        },
+                    );
+                    break;
+                }
+                Ok(None) => {}
+                Err(_) => break,
+            }
+        }
     });
 
     let stdout_app = app.clone();
@@ -8254,8 +8462,36 @@ fn acquire_single_instance_lock() -> Result<(), String> {
     Ok(())
 }
 
+/// File lock so second instance exits (macOS/Linux). Windows uses a named mutex.
 #[cfg(not(windows))]
 fn acquire_single_instance_lock() -> Result<(), String> {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let path = host_prefs_app_data_dir().join("single-instance.lock");
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|e| format!("无法创建单实例锁文件：{e}"))?;
+    // Non-blocking exclusive flock.
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = file.as_raw_fd();
+        let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            return Err("Grox 已在运行（只允许一个桌面实例）".into());
+        }
+    }
+    let _ = writeln!(file, "{}", std::process::id());
+    // Leak the file so the lock is held until process exit.
+    std::mem::forget(file);
     Ok(())
 }
 
@@ -8375,6 +8611,10 @@ fn main() {
             open_preview_external,
             computer_session_extensions,
             computer_use_env_enabled_cmd,
+            host_prefs_get,
+            host_prefs_set_computer_use,
+            host_prefs_set_permission_mode,
+            host_prefs_set_prompt_timeouts,
             computer_emergency_stop,
             computer_clear_emergency_stop,
             computer_revoke_http_auth,

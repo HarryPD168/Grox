@@ -27,6 +27,38 @@ export const PROMPT_TURN_ABSOLUTE_MS = 4 * 60 * 60_000;
 /** Poll interval for the FE watchdog. */
 export const PROMPT_TURN_POLL_MS = 2_000;
 
+/** Runtime overrides from host_prefs (0.2.19 platform debt). */
+let idleMsOverride: number | null = null;
+let absoluteMsOverride: number | null = null;
+
+/**
+ * Apply host-attested / Settings timeout overrides.
+ * Clamped: idle 5–1440 min, absolute 1–24 h.
+ */
+export function configurePromptTurnTimeouts(opts: {
+  idleMinutes?: number | null;
+  absoluteHours?: number | null;
+}): void {
+  if (opts.idleMinutes != null && opts.idleMinutes >= 5 && opts.idleMinutes <= 1440) {
+    idleMsOverride = opts.idleMinutes * 60_000;
+  } else if (opts.idleMinutes === null) {
+    idleMsOverride = null;
+  }
+  if (opts.absoluteHours != null && opts.absoluteHours >= 1 && opts.absoluteHours <= 24) {
+    absoluteMsOverride = opts.absoluteHours * 3_600_000;
+  } else if (opts.absoluteHours === null) {
+    absoluteMsOverride = null;
+  }
+}
+
+export function effectivePromptTurnIdleMs(): number {
+  return idleMsOverride ?? PROMPT_TURN_IDLE_MS;
+}
+
+export function effectivePromptTurnAbsoluteMs(): number {
+  return absoluteMsOverride ?? PROMPT_TURN_ABSOLUTE_MS;
+}
+
 export type PromptTurnExpireReason = "ok" | "first_event" | "idle" | "absolute";
 
 export function shouldExpirePromptTurn(args: {
@@ -50,8 +82,8 @@ export function shouldExpirePromptTurn(args: {
   absoluteMs?: number;
 }): PromptTurnExpireReason {
   const firstEventMs = args.firstEventMs ?? FIRST_EVENT_STALL_MS;
-  const idleMs = args.idleMs ?? PROMPT_TURN_IDLE_MS;
-  const absoluteMs = args.absoluteMs ?? PROMPT_TURN_ABSOLUTE_MS;
+  const idleMs = args.idleMs ?? effectivePromptTurnIdleMs();
+  const absoluteMs = args.absoluteMs ?? effectivePromptTurnAbsoluteMs();
 
   if (args.now - args.writtenAt >= absoluteMs) return "absolute";
 
@@ -96,9 +128,9 @@ export function promptTurnTimeoutMessage(
       return `Agent 超过 ${seconds}s 无事件返回（常见于大会话绑定后首包较慢或上一轮工具未结束）。已自动终止，可发消息重试。`;
     }
     case "idle":
-      return `Agent 超过 ${Math.round(PROMPT_TURN_IDLE_MS / 60_000)} 分钟无新输出且无运行中工具。已自动终止，可发消息继续。`;
+      return `Agent 超过 ${Math.round(effectivePromptTurnIdleMs() / 60_000)} 分钟无新输出且无运行中工具。已自动终止，可发消息继续。`;
     case "absolute":
-      return `本轮已超过 ${Math.round(PROMPT_TURN_ABSOLUTE_MS / 3_600_000)} 小时上限。已自动终止，可发消息继续。`;
+      return `本轮已超过 ${Math.round(effectivePromptTurnAbsoluteMs() / 3_600_000)} 小时上限。已自动终止，可发消息继续。`;
   }
 }
 

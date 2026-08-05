@@ -1,6 +1,6 @@
 [package]
 name = "grox-desktop"
-version = "0.2.18"
+version = "0.2.19"
 description = "Grox desktop agent powered by Grok Build"
 edition = "2021"
 rust-version = "1.77"
@@ -24,6 +24,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 futures-util = "0.3"
 image = { version = "0.25", default-features = false, features = ["png"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
   "Win32_Foundation",
@@ -31,6 +34,7 @@ windows = { version = "0.58", features = [
   "Win32_Security",
   "Win32_Security_Cryptography",
   "Win32_Storage_FileSystem",
+  "Win32_System_JobObjects",
   "Win32_System_Memory",
   "Win32_System_Threading",
   "Win32_UI_HiDpi",

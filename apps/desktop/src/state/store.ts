@@ -8,7 +8,11 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { bridge } from "../bridge";
 import { DEFAULT_PERMISSION_MODE, MODELS, readStoredPermissionMode } from "../bridge/types";
-import { computerUseOptInRefuseMessage } from "../lib/computerUse";
+import {
+  computerUseOptInRefuseMessage,
+  setComputerUseHostPrefsEnabled,
+} from "../lib/computerUse";
+import { configurePromptTurnTimeouts } from "../lib/promptTurnTimeout";
 import { isFeatureEnabled } from "../lib/featureFlags";
 import { tOp } from "../lib/operatorLocale";
 import { isSafeMarkdownOpenUrl } from "../lib/openUrlSafety";
@@ -2442,6 +2446,34 @@ export const useDesktop = create<DesktopState>((set, get) => {
           bridge.getModelState(),
           bridge.getProviderStatus(),
         ]);
+        // Host-attested prefs (Computer Use + permission + timeout overrides).
+        if (bridge.kind === "acp") {
+          try {
+            const prefs = await invoke<{
+              computerUseEnabled?: boolean;
+              permissionMode?: string;
+              promptIdleMinutes?: number | null;
+              promptAbsoluteHours?: number | null;
+            }>("host_prefs_get");
+            if (typeof prefs.computerUseEnabled === "boolean") {
+              setComputerUseHostPrefsEnabled(prefs.computerUseEnabled);
+            }
+            if (
+              prefs.permissionMode === "default" ||
+              prefs.permissionMode === "auto" ||
+              prefs.permissionMode === "bypass"
+            ) {
+              localStorage.setItem("grok.permissionMode", prefs.permissionMode);
+              set({ permissionMode: prefs.permissionMode });
+            }
+            configurePromptTurnTimeouts({
+              idleMinutes: prefs.promptIdleMinutes ?? null,
+              absoluteHours: prefs.promptAbsoluteHours ?? null,
+            });
+          } catch {
+            /* older shell */
+          }
+        }
         // Product default Auto: if the operator never set a mode, persist + push to bridge.
         if (localStorage.getItem("grok.permissionMode") == null) {
           localStorage.setItem("grok.permissionMode", DEFAULT_PERMISSION_MODE);
@@ -4678,25 +4710,45 @@ export const useDesktop = create<DesktopState>((set, get) => {
       // Product preference is global: update default + every session composer so
       // Settings/Home do not fight stale per-session modes, and background turns
       // do not keep a previous Bypass after the operator switches to Default.
-      const { sessionComposers, sessions, model, effort, mode } = get();
-      localStorage.setItem("grok.permissionMode", permissionMode);
-      bridge.setPermissionMode(permissionMode);
-      const next = { ...sessionComposers };
-      const ids = new Set([...Object.keys(sessions), ...Object.keys(sessionComposers)]);
-      for (const id of ids) {
-        const current = next[id] ?? {
-          text: "",
-          attachments: [],
-          model,
-          effort,
-          mode,
-          permissionMode,
-        };
-        next[id] = { ...current, permissionMode };
-        bridge.setPermissionMode(permissionMode, id);
+      const apply = (mode: PermissionMode) => {
+        const { sessionComposers, sessions, model, effort, mode: agentMode } = get();
+        localStorage.setItem("grok.permissionMode", mode);
+        bridge.setPermissionMode(mode);
+        const next = { ...sessionComposers };
+        const ids = new Set([...Object.keys(sessions), ...Object.keys(sessionComposers)]);
+        for (const id of ids) {
+          const current = next[id] ?? {
+            text: "",
+            attachments: [],
+            model,
+            effort,
+            mode: agentMode,
+            permissionMode: mode,
+          };
+          next[id] = { ...current, permissionMode: mode };
+          bridge.setPermissionMode(mode, id);
+        }
+        persistSessionComposers(next);
+        set({ permissionMode: mode, sessionComposers: next });
+      };
+      // Host-attest Bypass (0.2.19): native confirm + host_prefs.json.
+      if (permissionMode === "bypass" && get().permissionMode !== "bypass") {
+        void invoke<{ permissionMode?: string }>("host_prefs_set_permission_mode", {
+          mode: "bypass",
+        })
+          .then(() => apply("bypass"))
+          .catch((error) => {
+            set({
+              startupError:
+                error instanceof Error ? error.message : String(error),
+            });
+          });
+        return;
       }
-      persistSessionComposers(next);
-      set({ permissionMode, sessionComposers: next });
+      void invoke("host_prefs_set_permission_mode", { mode: permissionMode }).catch(() => {
+        /* older shell / non-tauri */
+      });
+      apply(permissionMode);
     },
 
     setSandboxPreference(preference) {
