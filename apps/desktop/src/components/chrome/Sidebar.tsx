@@ -573,7 +573,17 @@ function ProjectRow({
     setCreating(true);
     try {
       onExpand();
-      await openProject(project.id);
+      // Only switch workspace when needed — setWorkspace listSessions used to
+      // drop offline catalog rows for this project (fixed in merge, still skip
+      // the expensive round-trip when already on this project).
+      const state = useDesktop.getState();
+      const alreadyHere =
+        state.activeProjectId === project.id &&
+        state.workspace.replace(/[\\/]+$/, "").toLowerCase() ===
+          project.path.replace(/[\\/]+$/, "").toLowerCase();
+      if (!alreadyHere) {
+        await openProject(project.id);
+      }
       await newSession();
     } finally {
       setCreating(false);

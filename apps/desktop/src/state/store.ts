@@ -57,6 +57,7 @@ import type {
 } from "../bridge/types";
 import { DEMO_CWD } from "../demo/data";
 import { mergeOfflineWithLive } from "../lib/offlineMerge";
+import { mergeProjectSessionsPure } from "../lib/sessionCatalogMerge";
 import {
   consumeShellUpgradeRescan,
   shouldForceOfflineRescan,
@@ -1076,18 +1077,19 @@ function mergeProjectSessions(
   cwd: string,
   incoming: SessionMeta[],
 ): SessionMeta[] {
-  const filteredIncoming = filterHiddenSessions(incoming);
-  const incomingIds = new Set(filteredIncoming.map((meta) => meta.id));
+  // Union CLI list with local catalog for this cwd — never drop offline-only
+  // missions when x.ai/session/list returns a partial cwd slice (project "+"
+  // new session → openProject → setWorkspace used to wipe the sidebar).
   const hidden = loadHiddenSessionIds();
-  const merged = [
-    ...decorateSessions(filteredIncoming),
-    ...existing.filter(
-      (meta) =>
-        !hidden.has(meta.id) &&
-        !samePath(meta.cwd, cwd) &&
-        !incomingIds.has(meta.id),
-    ),
-  ].sort((a, b) => b.updatedAt - a.updatedAt);
+  const merged = decorateSessions(
+    mergeProjectSessionsPure(
+      existing,
+      samePath,
+      cwd,
+      filterHiddenSessions(incoming),
+      hidden,
+    ) as SessionMeta[],
+  );
   persistSessionCatalog(merged);
   return merged;
 }
